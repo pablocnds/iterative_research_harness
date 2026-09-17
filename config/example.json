@@ -1,0 +1,45 @@
+{
+  "data_root": "/var/lib/iterative-research-harness",
+  "socket_path": "/var/lib/iterative-research-harness/daemon.sock",
+  "runtime_user": "rh-agent",
+  "operator_group": "irh-worker",
+  "model": {
+    "base_url": "http://100.97.90.14:3000",
+    "model": "replace-with-model-id",
+    "api_key_file": "/var/lib/iterative-research-harness/model.key",
+    "context_window": 131072,
+    "max_output_tokens": 16384,
+    "temperature": 1.0,
+    "extra_body": {}
+  },
+  "sandbox": {
+    "bubblewrap": "/usr/bin/bwrap",
+    "iteration_network": "host",
+    "command_output_bytes": 262144
+  },
+  "project_seconds": 604800,
+  "iteration_seconds": 28800,
+  "max_iteration_seconds": 86400,
+  "upper_seconds": 7200,
+  "tools": [
+    {
+      "id": "manual",
+      "configuration_id": "manual-intervention-tool@0.1.0",
+      "transport": {
+        "type": "stdio",
+        "command": "/srv/manual-intervention-tool/current/.venv/bin/manual-intervention-tool",
+        "args": [],
+        "env": {}
+      },
+      "roles": {
+        "upper": ["request_manual_intervention"],
+        "iteration": ["request_manual_intervention"]
+      },
+      "guidance": {
+        "upper": "Request manual intervention only when the project cannot safely continue without the operator.",
+        "iteration": "Request manual intervention only after recording the blocker and reasonable attempts to resolve it."
+      },
+      "pause_on_calls": ["request_manual_intervention"]
+    }
+  ]
+}

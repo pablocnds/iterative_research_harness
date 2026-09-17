@@ -1,0 +1,42 @@
+{
+  "id": "runpod",
+  "configuration_id": "runpod-agent-tool@0.1.0+mcp-adapter@0.2.0",
+  "transport": {
+    "type": "stdio",
+    "command": "/srv/irh/current/.venv/bin/irh-runpod-mcp",
+    "args": [
+      "--socket",
+      "/var/lib/runpod-agent-tool/tool.sock",
+      "--project-id",
+      "{project_id}",
+      "--session-id",
+      "{project_id}",
+      "--max-gpu-seconds",
+      "72000",
+      "--input-root",
+      "/var/lib/runpod-agent-tool/inputs",
+      "--output-root",
+      "/var/lib/runpod-agent-tool/outputs",
+      "--workspace",
+      "{workspace}",
+      "--role",
+      "{role}"
+    ],
+    "env": {}
+  },
+  "roles": {
+    "upper": ["status"],
+    "iteration": ["run", "status", "wait", "cancel", "replace"]
+  },
+  "guidance": {
+    "upper": "Use runpod__status only to review remaining GPU budget and durable job state.",
+    "iteration": "GPU jobs are asynchronous. List explicit input and output paths, use runpod__wait instead of repeated polling, and inspect exit state and synchronized outputs before drawing conclusions."
+  },
+  "pause_on_calls": [],
+  "monitor": {
+    "tool": "host_status",
+    "interval_seconds": 5,
+    "blocked_field": "incident",
+    "pause_on_error": true
+  }
+}

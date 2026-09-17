@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+from . import __version__
+from .config import HarnessConfig
+from .controller import COMMON_PROMPT, ITERATION_PROMPT, UPPER_PROMPT, Supervisor
+from .errors import ConflictError, HarnessError, NotFoundError
+from .store import Store
+from .types import ProjectCreate
+from .workspace import WorkspaceManager
+
+
+def json_response(value: object, status: int = 200) -> JSONResponse:
+    return JSONResponse(value, status_code=status)
+
+
+async def body(request: Request) -> dict[str, Any]:
+    value = await request.json()
+    if not isinstance(value, dict):
+        raise TypeError("JSON body must be an object")
+    return value
+
+
+def source_identity() -> dict[str, str | None]:
+    root = Path(__file__).resolve().parents[2]
+    release = root / "release.json"
+    if release.is_file():
+        value = json.loads(release.read_text())
+        return {
+            "version": str(value.get("version", __version__)),
+            "git_revision": value.get("git_revision"),
+            "source_sha256": value.get("source_sha256"),
+        }
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    return {
+        "version": __version__,
+        "git_revision": result.stdout.strip() if result.returncode == 0 else None,
+        "source_sha256": None,
+    }
+
+
+def read_skills(paths: list[str]) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    for value in paths:
+        path = Path(value).resolve()
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"Skill must be a regular non-symlink file: {value}")
+        if path.stat().st_size > 128 * 1024:
+            raise ValueError(f"Skill exceeds 128 KiB: {value}")
+        text = path.read_text()
+        result.append(
+            {
+                "name": path.name,
+                "source": str(path),
+                "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "text": text,
+            }
+        )
+    return result
+
+
+def create_app(
+    config: HarnessConfig,
+    store: Store,
+    supervisor: Supervisor,
+    restart_callback: Any = None,
+) -> Starlette:
+    workspaces = WorkspaceManager(store)
+
+    async def health(_request: Request) -> JSONResponse:
+        active = [key for key, task in supervisor.tasks.items() if not task.done()]
+        return json_response({"ok": True, "version": __version__, "active_projects": active})
+
+    async def create_project(request: Request) -> JSONResponse:
+        value = ProjectCreate.model_validate(await body(request))
+        for tool_id in value.tools:
+            config.tool(tool_id)
+        snapshot = {
+            "source": source_identity(),
+            "base_prompts": {"common": COMMON_PROMPT, "upper": UPPER_PROMPT, "iteration": ITERATION_PROMPT},
+            "enabled_tools": value.tools,
+            "tool_configurations": [
+                {"id": config.tool(tool_id).id, "configuration_id": config.tool(tool_id).configuration_id}
+                for tool_id in value.tools
+            ],
+            "skills": {
+                "upper": read_skills(value.upper_skills),
+                "iteration": read_skills(value.iteration_skills),
+            },
+        }
+        project = store.create_project(value, snapshot, config.project_seconds)
+        return json_response(project, 201)
+
+    async def list_projects(_request: Request) -> JSONResponse:
+        return json_response(store.list_projects())
+
+    async def project_status(request: Request) -> JSONResponse:
+        project_id = request.path_params["project_id"]
+        return json_response(
+            {
+                "project": store.get_project(project_id),
+                "iterations": store.history(project_id),
+                "artifacts": store.artifacts(project_id),
+            }
+        )
+
+    async def add_resource(request: Request) -> JSONResponse:
+        value = await body(request)
+        if not isinstance(value.get("source"), str) or not isinstance(value.get("name"), str):
+            raise TypeError("source and name are required strings")
+        result = await __import__("asyncio").to_thread(
+            workspaces.add_resource,
+            request.path_params["project_id"],
+            Path(value["source"]),
+            value["name"],
+        )
+        return json_response(result, 201)
+
+    async def run_project(request: Request) -> JSONResponse:
+        value = await body(request)
+        result = await supervisor.start(request.path_params["project_id"], bool(value.get("resume", False)))
+        return json_response(result, 202)
+
+    async def pause_project(request: Request) -> JSONResponse:
+        return json_response(await supervisor.pause(request.path_params["project_id"]), 202)
+
+    async def events(request: Request) -> JSONResponse:
+        after = int(request.query_params.get("after", "0"))
+        limit = int(request.query_params.get("limit", "200"))
+        return json_response(store.events(request.path_params["project_id"], after, limit))
+
+    async def artifacts(request: Request) -> JSONResponse:
+        return json_response(store.artifacts(request.path_params["project_id"]))
+
+    async def restart(_request: Request) -> JSONResponse:
+        active = [key for key, task in supervisor.tasks.items() if not task.done()]
+        if active:
+            raise ConflictError(f"Pause the active project before updating: {active[0]}")
+        if restart_callback is None:
+            raise ConflictError("Daemon restart is unavailable in this process")
+        restart_callback()
+        return json_response({"accepted": True, "action": "daemon_restart"}, 202)
+
+    async def exception_handler(_request: Request, error: Exception) -> JSONResponse:
+        if isinstance(error, NotFoundError):
+            return json_response({"error": "not_found", "message": str(error)}, 404)
+        if isinstance(error, ConflictError):
+            return json_response({"error": "conflict", "message": str(error)}, 409)
+        if isinstance(error, (ValidationError, ValueError, TypeError, HarnessError, json.JSONDecodeError)):
+            return json_response({"error": "invalid_request", "message": str(error)}, 400)
+        return json_response({"error": "internal_error", "message": "Internal daemon error"}, 500)
+
+    return Starlette(
+        routes=[
+            Route("/v1/health", health, methods=["GET"]),
+            Route("/v1/projects", create_project, methods=["POST"]),
+            Route("/v1/projects", list_projects, methods=["GET"]),
+            Route("/v1/projects/{project_id}", project_status, methods=["GET"]),
+            Route("/v1/projects/{project_id}/resources", add_resource, methods=["POST"]),
+            Route("/v1/projects/{project_id}/run", run_project, methods=["POST"]),
+            Route("/v1/projects/{project_id}/pause", pause_project, methods=["POST"]),
+            Route("/v1/projects/{project_id}/events", events, methods=["GET"]),
+            Route("/v1/projects/{project_id}/artifacts", artifacts, methods=["GET"]),
+            Route("/v1/admin/restart", restart, methods=["POST"]),
+        ],
+        exception_handlers={Exception: exception_handler},
+    )

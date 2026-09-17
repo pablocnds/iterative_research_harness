@@ -1,0 +1,25 @@
+[Unit]
+Description=Iterative Research Harness daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rh-agent
+Group=irh-worker
+ExecStart=/srv/irh/current/.venv/bin/irh-daemon --config /var/lib/iterative-research-harness/config.json
+Restart=on-failure
+RestartSec=3
+RestartForceExitStatus=75
+TimeoutStopSec=45
+UMask=0007
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/iterative-research-harness
+ReadWritePaths=-/var/lib/runpod-agent-tool
+
+[Install]
+WantedBy=multi-user.target
