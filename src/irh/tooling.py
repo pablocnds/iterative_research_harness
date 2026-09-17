@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -142,6 +143,15 @@ class MCPHub:
                 for declared in all_tools:
                     if declared.name not in allowed:
                         continue
+                    if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", declared.name):
+                        raise ValueError(
+                            f"MCP tool name is not compatible with the configured model API: "
+                            f"{config.id}.{declared.name}"
+                        )
+                    if declared.input_schema.get("type") != "object":
+                        raise ValueError(
+                            f"MCP tool {config.id}.{declared.name} must use an object input schema"
+                        )
                     exposed.append(declared.name)
                     model_name = f"{config.id}__{declared.name}"
                     if len(model_name) > 64:
