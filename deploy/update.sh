@@ -9,6 +9,7 @@ REVISION=$(git -C "$SOURCE_DIR" rev-parse --short=12 HEAD 2>/dev/null || printf 
 SOURCE_SHA=$(find "$SOURCE_DIR/src" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
 RELEASE="$RELEASE_ROOT/$STAMP-$REVISION"
 UV_BIN=${UV_BIN:-/home/omega/.local/bin/uv}
+DEPLOY_PYTHON=${DEPLOY_PYTHON:-/usr/bin/python3}
 
 test "$(id -u)" -ne 0 || { printf '%s\n' 'Run deploy/update.sh as omega, not root.' >&2; exit 1; }
 test -d "$RELEASE_ROOT" || { printf '%s\n' 'Run the one-time bootstrap first.' >&2; exit 1; }
@@ -19,7 +20,7 @@ trap cleanup EXIT HUP INT TERM
 cp -a "$SOURCE_DIR/src" "$SOURCE_DIR/pyproject.toml" "$SOURCE_DIR/README.md" "$SOURCE_DIR/uv.lock" "$RELEASE/"
 printf '{"version":"0.2.0","git_revision":"%s","source_sha256":"%s"}\n' \
   "$REVISION" "$SOURCE_SHA" > "$RELEASE/release.json"
-"$UV_BIN" sync --directory "$RELEASE" --frozen --no-dev
+"$UV_BIN" sync --directory "$RELEASE" --frozen --no-dev --python "$DEPLOY_PYTHON"
 chmod -R go-w "$RELEASE"
 SWITCH_LINK=$(dirname "$CURRENT_LINK")/.current-$STAMP
 ln -s "$RELEASE" "$SWITCH_LINK"
