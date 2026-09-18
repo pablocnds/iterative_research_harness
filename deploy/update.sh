@@ -18,7 +18,7 @@ mkdir "$RELEASE"
 cleanup() { find "$RELEASE" -depth -delete 2>/dev/null || true; }
 trap cleanup EXIT HUP INT TERM
 cp -a "$SOURCE_DIR/src" "$SOURCE_DIR/skills" "$SOURCE_DIR/pyproject.toml" "$SOURCE_DIR/README.md" "$SOURCE_DIR/uv.lock" "$RELEASE/"
-printf '{"version":"0.2.1","git_revision":"%s","source_sha256":"%s"}\n' \
+printf '{"version":"0.2.2","git_revision":"%s","source_sha256":"%s"}\n' \
   "$REVISION" "$SOURCE_SHA" > "$RELEASE/release.json"
 "$UV_BIN" sync --directory "$RELEASE" --frozen --no-dev --python "$DEPLOY_PYTHON"
 chmod -R go-w "$RELEASE"

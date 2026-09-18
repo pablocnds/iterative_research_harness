@@ -16,6 +16,7 @@ class ModelConfig(BaseModel):
     api_key_file: Path
     context_window: int = Field(default=131_072, gt=8_192)
     max_output_tokens: int = Field(default=16_384, gt=0)
+    request_timeout_seconds: float = Field(default=3_600, gt=0)
     temperature: float = 1.0
     extra_body: dict[str, object] = Field(default_factory=dict)
 

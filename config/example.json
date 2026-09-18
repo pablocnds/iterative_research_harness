@@ -9,6 +9,7 @@
     "api_key_file": "/var/lib/iterative-research-harness/model.key",
     "context_window": 131072,
     "max_output_tokens": 16384,
+    "request_timeout_seconds": 3600,
     "temperature": 1.0,
     "extra_body": {}
   },

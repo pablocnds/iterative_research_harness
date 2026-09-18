@@ -7,8 +7,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from httpx import Timeout
 from jsonschema import validate
-from openai import AsyncOpenAI
+from openai import APIError, AsyncOpenAI
 
 from .config import HarnessConfig, read_secret
 from .errors import InterventionRequired
@@ -49,6 +50,13 @@ class AgentSession:
         self.client = AsyncOpenAI(
             base_url=config.model.base_url.rstrip("/") + "/v1",
             api_key=read_secret(config.model.api_key_file),
+            max_retries=0,
+            timeout=Timeout(
+                config.model.request_timeout_seconds,
+                connect=10,
+                write=60,
+                pool=60,
+            ),
         )
         self.messages: list[dict[str, Any]] = []
         self.usage = {"input_tokens": 0, "output_tokens": 0, "model": config.model.model, "compactions": 0}
@@ -75,6 +83,15 @@ class AgentSession:
         await asyncio.gather(stopped, return_exceptions=True)
         return await work
 
+    async def _complete(self, **request: Any) -> Any:
+        try:
+            return await self._await_or_abort(self.client.chat.completions.create(**request))
+        except APIError as error:
+            raise InterventionRequired(
+                "model",
+                {"type": type(error).__name__, "error": str(error)},
+            ) from error
+
     def _estimated_tokens(self) -> int:
         return sum(len(json.dumps(message, ensure_ascii=False)) for message in self.messages) // 4
 
@@ -84,20 +101,18 @@ class AgentSession:
         if self._estimated_tokens() < threshold or len(self.messages) < 10:
             return
         older, recent = self.messages[:-8], self.messages[-8:]
-        response = await self._await_or_abort(
-            self.client.chat.completions.create(
-                model=self.config.model.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Summarize this agent history for exact continuation. Preserve decisions, evidence paths, measurements, failures, open work, and tool state. Do not invent facts.",
-                    },
-                    {"role": "user", "content": json.dumps(older, ensure_ascii=False)},
-                ],
-                max_tokens=min(4096, self.config.model.max_output_tokens),
-                temperature=0,
-                extra_body=self.config.model.extra_body or None,
-            )
+        response = await self._complete(
+            model=self.config.model.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Summarize this agent history for exact continuation. Preserve decisions, evidence paths, measurements, failures, open work, and tool state. Do not invent facts.",
+                },
+                {"role": "user", "content": json.dumps(older, ensure_ascii=False)},
+            ],
+            max_tokens=min(4096, self.config.model.max_output_tokens),
+            temperature=0,
+            extra_body=self.config.model.extra_body or None,
         )
         summary = response.choices[0].message.content or "No summary was returned."
         self.messages = [{"role": "user", "content": "Prior-session summary:\n" + summary}, *recent]
@@ -113,16 +128,14 @@ class AgentSession:
             if self.abort.is_set():
                 raise asyncio.CancelledError("Agent phase was stopped")
             await self.compact_if_needed()
-            response = await self._await_or_abort(
-                self.client.chat.completions.create(
-                    model=self.config.model.model,
-                    messages=[{"role": "system", "content": self.system_prompt}, *self.messages],
-                    tools=definitions,
-                    tool_choice="auto",
-                    max_tokens=self.config.model.max_output_tokens,
-                    temperature=self.config.model.temperature,
-                    extra_body=self.config.model.extra_body or None,
-                )
+            response = await self._complete(
+                model=self.config.model.model,
+                messages=[{"role": "system", "content": self.system_prompt}, *self.messages],
+                tools=definitions,
+                tool_choice="auto",
+                max_tokens=self.config.model.max_output_tokens,
+                temperature=self.config.model.temperature,
+                extra_body=self.config.model.extra_body or None,
             )
             if response.usage:
                 self.usage["input_tokens"] += response.usage.prompt_tokens

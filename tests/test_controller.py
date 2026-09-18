@@ -4,8 +4,11 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
+from httpx import Request
+from openai import APITimeoutError
 
 import irh.agent
 from irh.config import ExternalToolConfig
@@ -72,7 +75,10 @@ class FakeCompletions:
 
 
 class FakeOpenAI:
-    def __init__(self, **_kwargs):
+    latest_kwargs: ClassVar[dict[str, object]] = {}
+
+    def __init__(self, **kwargs):
+        self.__class__.latest_kwargs = kwargs
         self.chat = SimpleNamespace(completions=FakeCompletions())
 
 
@@ -94,6 +100,16 @@ class InterventionOpenAI:
         self.chat = SimpleNamespace(completions=InterventionCompletions())
 
 
+class FailingCompletions:
+    async def create(self, **_request):
+        raise APITimeoutError(request=Request("POST", "http://model/v1/chat/completions"))
+
+
+class FailingOpenAI:
+    def __init__(self, **_kwargs):
+        self.chat = SimpleNamespace(completions=FailingCompletions())
+
+
 @pytest.mark.asyncio
 async def test_complete_research_loop_with_hashed_artifact(config, monkeypatch) -> None:
     FakeCompletions.upper_calls = 0
@@ -111,6 +127,8 @@ async def test_complete_research_loop_with_hashed_artifact(config, monkeypatch) 
     artifact = store.artifacts(project["id"])[0]
     assert artifact["path"] == "result.txt"
     assert len(artifact["sha256"]) == 64
+    assert FakeOpenAI.latest_kwargs["max_retries"] == 0
+    assert FakeOpenAI.latest_kwargs["timeout"].read == 3600
     store.close()
 
 
@@ -143,4 +161,25 @@ async def test_manual_intervention_tool_pauses_the_controller(config, monkeypatc
     assert paused["phase"] == "paused"
     assert paused["resume_phase"] == "planning"
     assert any(event["kind"] == "operator_intervention_required" for event in store.events(project["id"]))
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_model_request_failure_pauses_for_intervention(config, monkeypatch) -> None:
+    monkeypatch.setattr(irh.agent, "AsyncOpenAI", FailingOpenAI)
+    store = Store(config.data_root)
+    project = store.create_project(
+        ProjectCreate(name="model failure", goal="pause safely"),
+        {"enabled_tools": [], "skills": {"upper": [], "iteration": []}},
+        600,
+    )
+    await Controller(config, store, project["id"]).run()
+    paused = store.get_project(project["id"])
+    assert paused["phase"] == "paused"
+    assert paused["resume_phase"] == "planning"
+    assert paused["pause_reason"] == "model requires operator intervention"
+    events = store.events(project["id"])
+    intervention = next(event for event in events if event["kind"] == "operator_intervention_required")
+    assert intervention["data"]["source"] == "model"
+    assert intervention["data"]["detail"]["type"] == "APITimeoutError"
     store.close()
