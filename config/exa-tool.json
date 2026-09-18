@@ -1,0 +1,21 @@
+{
+  "id": "exa",
+  "configuration_id": "exa-hosted-mcp@3.2.1",
+  "transport": {
+    "type": "http",
+    "url": "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa",
+    "headers": {},
+    "header_files": {
+      "x-api-key": "/var/lib/iterative-research-harness/exa.key"
+    }
+  },
+  "roles": {
+    "upper": ["web_search_exa", "web_fetch_exa"],
+    "iteration": ["web_search_exa", "web_fetch_exa"]
+  },
+  "guidance": {
+    "upper": "Use Exa search to locate relevant sources, fetch the strongest sources before relying on them, and cite source URLs in durable notes and decisions.",
+    "iteration": "Use Exa search and fetch when external evidence is needed. Prefer primary sources and preserve source URLs with the resulting evidence."
+  },
+  "pause_on_calls": []
+}

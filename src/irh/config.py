@@ -41,6 +41,14 @@ class HttpTransport(BaseModel):
     type: Literal["http"]
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
+    header_files: dict[str, Path] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_headers(self) -> HttpTransport:
+        overlap = self.headers.keys() & self.header_files.keys()
+        if overlap:
+            raise ValueError(f"HTTP header configured twice: {min(overlap)}")
+        return self
 
 
 class MonitorConfig(BaseModel):
@@ -114,6 +122,11 @@ def load_config(path: Path | str | None = None) -> HarnessConfig:
     config.data_root = config.data_root.resolve()
     config.socket_path = config.socket_path.resolve()
     config.model.api_key_file = config.model.api_key_file.resolve()
+    for tool in config.tools:
+        if isinstance(tool.transport, HttpTransport):
+            tool.transport.header_files = {
+                name: secret.resolve() for name, secret in tool.transport.header_files.items()
+            }
     return config
 
 

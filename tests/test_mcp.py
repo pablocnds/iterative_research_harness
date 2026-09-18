@@ -5,12 +5,27 @@ import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from irh.config import ExternalToolConfig
+from irh.config import ExternalToolConfig, HttpTransport
 from irh.errors import InterventionRequired
 from irh.store import Store
 from irh.tooling import MCPHub
 from irh.types import ProjectCreate
+
+
+def test_http_transport_rejects_duplicate_header_source(tmp_path: Path) -> None:
+    secret = tmp_path / "key"
+    secret.write_text("secret")
+    with pytest.raises(ValidationError, match="HTTP header configured twice"):
+        HttpTransport.model_validate(
+            {
+                "type": "http",
+                "url": "https://mcp.example.test/mcp",
+                "headers": {"x-api-key": "literal"},
+                "header_files": {"x-api-key": str(secret)},
+            }
+        )
 
 
 @pytest.mark.asyncio

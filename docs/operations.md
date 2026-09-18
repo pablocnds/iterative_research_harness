@@ -13,7 +13,8 @@ endpoint and model ID. Then run:
 ```sh
 sudo /home/omega/llms/iterative_research_harness/deploy/bootstrap-root.sh \
   --config /absolute/path/to/config.local.json \
-  --model-key /absolute/path/to/model-api-key
+  --model-key /absolute/path/to/model-api-key \
+  --exa-key /absolute/path/to/exa-api-key
 ```
 
 The script removes only these old deployment paths:
@@ -76,4 +77,3 @@ journalctl -u irh-daemon.service
 Paths supplied to `add-resource` and project skill options must be readable by
 `rh-agent`. Place operator-provided files in a shared group-readable location
 when the operator home directory itself is not traversable by that account.
-

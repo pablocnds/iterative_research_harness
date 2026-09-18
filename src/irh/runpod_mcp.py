@@ -146,7 +146,7 @@ class RunpodAPI:
 def build_server(api: RunpodAPI) -> MCPServer:
     server = MCPServer(
         "runpod-agent-tool",
-        version="0.1.0",
+        version="0.1.1",
         instructions=(
             "Submit asynchronous GPU jobs with explicit inputs and outputs. Use wait rather than repeated status calls. "
             "Commands run in one retained session workspace and may reuse its environment."

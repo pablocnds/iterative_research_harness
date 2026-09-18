@@ -9,9 +9,11 @@ from dataclasses import dataclass
 from typing import Any, Self
 
 from mcp import Client, StdioServerParameters
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp.types import TextContent
 
-from .config import ExternalToolConfig, HttpTransport, StdioTransport
+from .config import ExternalToolConfig, HttpTransport, StdioTransport, read_secret
 from .errors import InterventionRequired
 from .store import Store
 from .types import Role, ToolResult
@@ -65,11 +67,17 @@ class MCPConnection:
             )
             client = Client(params, read_timeout_seconds=300)
         elif isinstance(transport, HttpTransport):
-            # Authentication headers are intentionally not supported in the first
-            # release. Local stdio is the preferred trusted-tool boundary.
-            if transport.headers:
-                raise ValueError("HTTP MCP headers are not yet supported; use a local stdio adapter")
-            client = Client(_expand(transport.url, self.context), read_timeout_seconds=300)
+            headers = {
+                name: _expand(value, self.context) for name, value in transport.headers.items()
+            }
+            headers.update(
+                {name: read_secret(path) for name, path in transport.header_files.items()}
+            )
+            http = await self._stack.enter_async_context(create_mcp_http_client(headers=headers))
+            stream = streamable_http_client(
+                _expand(transport.url, self.context), http_client=http
+            )
+            client = Client(stream, read_timeout_seconds=300)
         else:  # pragma: no cover - Pydantic makes this unreachable
             raise TypeError("Unknown MCP transport")
         self.client = await self._stack.enter_async_context(client)

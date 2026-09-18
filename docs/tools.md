@@ -30,6 +30,17 @@ does not control the daemon. The harness configuration lists that native tool in
 `pause_on_calls`; after a successful call the harness records an
 `operator_intervention_required` event and pauses the project.
 
+## Exa web research
+
+The official hosted Exa MCP server provides `web_search_exa` and
+`web_fetch_exa` directly over Streamable HTTP. The harness supplies its API key
+from a private header file; the key is never part of project snapshots or model
+arguments. The example configuration is in `config/exa-tool.json`.
+
+Using the hosted MCP server avoids a Pi-specific integration and keeps search
+and fetching behind the same native tool boundary as every other optional
+capability.
+
 ## Runpod
 
 `irh-runpod-mcp` is a thin MCP facade over the standalone tool's private Unix
@@ -57,4 +68,3 @@ The example adapter configuration is in `config/runpod-tool.json`. Its
 and be writable/readable respectively by `rh-agent` (normally via
 `irh-worker`). Add that object to the main configuration's `tools` array before
 creating a project with `--tool runpod`.
-
