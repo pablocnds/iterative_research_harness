@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "iterative-research-harness"
-version = "0.2.2"
+version = "0.2.3"
 description = "A small, persistent harness for iterative research agents"
 readme = "README.md"
 requires-python = ">=3.11"

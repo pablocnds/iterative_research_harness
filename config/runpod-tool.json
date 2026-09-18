@@ -1,6 +1,6 @@
 {
   "id": "runpod",
-  "configuration_id": "runpod-agent-tool@0.1.1+mcp-adapter@0.2.1",
+  "configuration_id": "runpod-agent-tool@0.1.1+mcp-adapter@0.2.2",
   "transport": {
     "type": "stdio",
     "command": "/srv/irh/current/.venv/bin/irh-runpod-mcp",

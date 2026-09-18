@@ -149,7 +149,7 @@ def build_server(api: RunpodAPI) -> MCPServer:
         version="0.1.1",
         instructions=(
             "Submit asynchronous GPU jobs with explicit inputs and outputs. Use wait rather than repeated status calls. "
-            "Commands run in one retained session workspace and may reuse its environment."
+            "Bundle related setup, validation, downloads, and useful work into substantial jobs; avoid short probes."
         ),
     )
 
@@ -160,7 +160,7 @@ def build_server(api: RunpodAPI) -> MCPServer:
         setup_command: str | None = None,
         outputs: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Start an asynchronous GPU job and return its job handle immediately."""
+        """Start a substantial asynchronous GPU job and return its handle. Bundle related work; avoid short probes."""
         return api.call(
             "POST",
             "/runs",
