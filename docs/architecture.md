@@ -43,10 +43,13 @@ The iteration role executes one definition and uses `submit_results`.
 Sessions are stored as JSON and resumed for the upper agent and a controlled
 iteration continuation. When estimated context approaches the configured
 window, the model creates a compact continuation summary while retaining recent
-turns. Tool calls and usage are recorded separately in SQLite.
+turns. Tool calls and per-request model timing/token usage are recorded as
+append-only SQLite events. Project status exposes aggregate token usage without
+exposing the private session transcript. Reported token rates are effective
+tokens per full request second, including provider queueing and prompt handling;
+they are not a claim about raw decoder throughput.
 
 An unclean daemon loss turns an executing attempt into an explicit interrupted
 attempt and pauses for upper review. A controlled pause preserves the active
 workspace and session. Restarting a paused project always requires an explicit
 resume request.
-

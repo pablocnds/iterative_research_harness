@@ -51,6 +51,31 @@ def test_pause_and_explicit_resume(config) -> None:
     store.close()
 
 
+def test_model_activity_tracks_current_and_latest_request(config) -> None:
+    store = Store(config.data_root)
+    project = store.create_project(
+        ProjectCreate(name="study", goal="measure"), {"enabled_tools": [], "skills": {}}, 600
+    )
+    store.event(
+        project["id"],
+        "model_request_started",
+        {"role": "upper", "request_id": "request-1", "request_kind": "agent"},
+    )
+    running = store.model_activity(project["id"])
+    assert running["state"] == "running"
+    assert running["current_request"]["data"]["request_id"] == "request-1"
+    store.event(
+        project["id"],
+        "model_request_finished",
+        {"role": "upper", "request_id": "request-1", "request_kind": "agent", "ok": True},
+    )
+    idle = store.model_activity(project["id"])
+    assert idle["state"] == "idle"
+    assert idle["current_request"] is None
+    assert idle["latest_request"]["data"]["request_id"] == "request-1"
+    store.close()
+
+
 def test_unclean_active_controller_is_paused_on_daemon_restart(config) -> None:
     store = Store(config.data_root)
     project = store.create_project(

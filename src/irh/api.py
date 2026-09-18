@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,48 @@ def read_skills(paths: list[str]) -> list[dict[str, str]]:
     return result
 
 
+def model_usage(store: Store, project_id: str, controller_active: bool) -> dict[str, Any]:
+    def count(usage: dict[str, Any], name: str) -> int:
+        value = usage.get(name, 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+    sessions: list[dict[str, Any]] = []
+    directory = store.private_dir(project_id) / "sessions"
+    for path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
+        match = re.fullmatch(r"iteration-(\d+)", path.stem)
+        if path.stem != "upper" and match is None:
+            continue
+        try:
+            usage = json.loads(path.read_text()).get("usage", {})
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        input_tokens = count(usage, "input_tokens")
+        output_tokens = count(usage, "output_tokens")
+        sessions.append(
+            {
+                "session": path.stem,
+                "role": "upper" if path.stem == "upper" else "iteration",
+                "iteration": int(match.group(1)) if match is not None else None,
+                "model": usage.get("model") if isinstance(usage.get("model"), str) else None,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "compactions": count(usage, "compactions"),
+            }
+        )
+    totals = {
+        "input_tokens": sum(item["input_tokens"] for item in sessions),
+        "output_tokens": sum(item["output_tokens"] for item in sessions),
+        "total_tokens": sum(item["total_tokens"] for item in sessions),
+        "compactions": sum(item["compactions"] for item in sessions),
+    }
+    activity = store.model_activity(project_id)
+    if activity["state"] == "running" and not controller_active:
+        activity["state"] = "interrupted"
+    return {"totals": totals, "sessions": sessions, "activity": activity}
+
+
 def create_app(
     config: HarnessConfig,
     store: Store,
@@ -113,11 +156,15 @@ def create_app(
 
     async def project_status(request: Request) -> JSONResponse:
         project_id = request.path_params["project_id"]
+        task = supervisor.tasks.get(project_id)
         return json_response(
             {
                 "project": store.get_project(project_id),
                 "iterations": store.history(project_id),
                 "artifacts": store.artifacts(project_id),
+                "model_usage": model_usage(
+                    store, project_id, task is not None and not task.done()
+                ),
             }
         )
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -83,14 +84,84 @@ class AgentSession:
         await asyncio.gather(stopped, return_exceptions=True)
         return await work
 
-    async def _complete(self, **request: Any) -> Any:
+    async def _complete(self, request_kind: str, **request: Any) -> Any:
+        request_id = uuid.uuid4().hex
+        started = asyncio.get_running_loop().time()
+        self.store.event(
+            self.project_id,
+            "model_request_started",
+            {
+                "role": self.role,
+                "request_id": request_id,
+                "request_kind": request_kind,
+                "model": self.config.model.model,
+            },
+        )
         try:
-            return await self._await_or_abort(self.client.chat.completions.create(**request))
+            response = await self._await_or_abort(self.client.chat.completions.create(**request))
         except APIError as error:
+            self.store.event(
+                self.project_id,
+                "model_request_finished",
+                {
+                    "role": self.role,
+                    "request_id": request_id,
+                    "request_kind": request_kind,
+                    "model": self.config.model.model,
+                    "ok": False,
+                    "elapsed_seconds": asyncio.get_running_loop().time() - started,
+                    "error_type": type(error).__name__,
+                },
+            )
             raise InterventionRequired(
                 "model",
                 {"type": type(error).__name__, "error": str(error)},
             ) from error
+        except BaseException as error:
+            self.store.event(
+                self.project_id,
+                "model_request_finished",
+                {
+                    "role": self.role,
+                    "request_id": request_id,
+                    "request_kind": request_kind,
+                    "model": self.config.model.model,
+                    "ok": False,
+                    "elapsed_seconds": asyncio.get_running_loop().time() - started,
+                    "error_type": type(error).__name__,
+                },
+            )
+            raise
+        elapsed = asyncio.get_running_loop().time() - started
+        response_usage = response.usage
+        input_tokens = int(getattr(response_usage, "prompt_tokens", 0) or 0)
+        output_tokens = int(getattr(response_usage, "completion_tokens", 0) or 0)
+        self.usage["input_tokens"] += input_tokens
+        self.usage["output_tokens"] += output_tokens
+        self.save()
+        self.store.event(
+            self.project_id,
+            "model_request_finished",
+            {
+                "role": self.role,
+                "request_id": request_id,
+                "request_kind": request_kind,
+                "model": self.config.model.model,
+                "ok": True,
+                "elapsed_seconds": elapsed,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "effective_input_tokens_per_second": input_tokens / elapsed if elapsed > 0 else None,
+                "effective_output_tokens_per_second": output_tokens / elapsed if elapsed > 0 else None,
+                "effective_total_tokens_per_second": (input_tokens + output_tokens) / elapsed
+                if elapsed > 0
+                else None,
+                "cumulative_input_tokens": self.usage["input_tokens"],
+                "cumulative_output_tokens": self.usage["output_tokens"],
+            },
+        )
+        return response
 
     def _estimated_tokens(self) -> int:
         return sum(len(json.dumps(message, ensure_ascii=False)) for message in self.messages) // 4
@@ -102,6 +173,7 @@ class AgentSession:
             return
         older, recent = self.messages[:-8], self.messages[-8:]
         response = await self._complete(
+            request_kind="compaction",
             model=self.config.model.model,
             messages=[
                 {
@@ -129,6 +201,7 @@ class AgentSession:
                 raise asyncio.CancelledError("Agent phase was stopped")
             await self.compact_if_needed()
             response = await self._complete(
+                request_kind="agent",
                 model=self.config.model.model,
                 messages=[{"role": "system", "content": self.system_prompt}, *self.messages],
                 tools=definitions,
@@ -137,9 +210,6 @@ class AgentSession:
                 temperature=self.config.model.temperature,
                 extra_body=self.config.model.extra_body or None,
             )
-            if response.usage:
-                self.usage["input_tokens"] += response.usage.prompt_tokens
-                self.usage["output_tokens"] += response.usage.completion_tokens
             message = response.choices[0].message
             assistant: dict[str, Any] = {"role": "assistant", "content": message.content}
             if message.tool_calls:

@@ -373,6 +373,39 @@ class Store:
             for row in rows
         ]
 
+    def model_activity(self, project_id: str) -> dict[str, Any]:
+        self.get_project(project_id)
+        with self.lock:
+            latest = self.db.execute(
+                """SELECT seq,at,kind,data_json FROM events
+                   WHERE project_id=? AND kind IN ('model_request_started','model_request_finished')
+                   ORDER BY seq DESC LIMIT 1""",
+                (project_id,),
+            ).fetchone()
+            latest_finished = self.db.execute(
+                """SELECT seq,at,kind,data_json FROM events
+                   WHERE project_id=? AND kind='model_request_finished'
+                   ORDER BY seq DESC LIMIT 1""",
+                (project_id,),
+            ).fetchone()
+
+        def event(row: sqlite3.Row | None) -> dict[str, Any] | None:
+            if row is None:
+                return None
+            return {
+                "seq": row["seq"],
+                "at": row["at"],
+                "kind": row["kind"],
+                "data": decode(row["data_json"]),
+            }
+
+        current = event(latest) if latest is not None and latest["kind"] == "model_request_started" else None
+        return {
+            "state": "running" if current is not None else "idle",
+            "current_request": current,
+            "latest_request": event(latest_finished),
+        }
+
     def attempts(self, project_id: str, iteration: int) -> list[dict[str, Any]]:
         with self.lock:
             rows = self.db.execute(

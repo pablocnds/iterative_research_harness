@@ -66,6 +66,12 @@ The HTTP API uses the same operations under `/v1`. It is intentionally local in
 this version; Unix-socket permissions provide access control. There is no GUI,
 assistant agent, network listener, or independent mutation path.
 
+Project status includes aggregate model-token usage and current/latest request
+activity. The bounded event feed includes `model_request_started` and
+`model_request_finished` records with request latency and effective token rates,
+so a separate local observer can poll by cursor without reading private session
+files or the SQLite database directly.
+
 Status and logs need no sudo:
 
 ```sh

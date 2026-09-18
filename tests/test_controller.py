@@ -129,6 +129,13 @@ async def test_complete_research_loop_with_hashed_artifact(config, monkeypatch) 
     assert len(artifact["sha256"]) == 64
     assert FakeOpenAI.latest_kwargs["max_retries"] == 0
     assert FakeOpenAI.latest_kwargs["timeout"].read == 3600
+    events = store.events(project["id"], limit=100)
+    starts = [event for event in events if event["kind"] == "model_request_started"]
+    finishes = [event for event in events if event["kind"] == "model_request_finished"]
+    assert len(starts) == len(finishes) == 3
+    assert all(event["data"]["ok"] for event in finishes)
+    assert sum(event["data"]["input_tokens"] for event in finishes) == 30
+    assert sum(event["data"]["output_tokens"] for event in finishes) == 15
     store.close()
 
 
@@ -182,4 +189,7 @@ async def test_model_request_failure_pauses_for_intervention(config, monkeypatch
     intervention = next(event for event in events if event["kind"] == "operator_intervention_required")
     assert intervention["data"]["source"] == "model"
     assert intervention["data"]["detail"]["type"] == "APITimeoutError"
+    model_finished = next(event for event in events if event["kind"] == "model_request_finished")
+    assert model_finished["data"]["ok"] is False
+    assert model_finished["data"]["error_type"] == "APITimeoutError"
     store.close()
