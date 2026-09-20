@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .agent import AgentSession
+from .agent import AgentSession, atomic_json
 from .config import HarnessConfig
 from .errors import ConflictError, InterventionRequired
 from .internal_tools import phase_tools
@@ -131,6 +131,7 @@ class Controller:
                     self.store,
                     self.project_id,
                     role,
+                    workspace,
                     session_path,
                     prompt_with_guidance,
                     [*internal, *hub.model_tools],
@@ -227,18 +228,64 @@ class Controller:
             }
             for item in history
         ]
-        packet = {
-            "project": {key: value for key, value in project.items() if key != "snapshot"},
-            "history": history_summary,
-            "latest": latest,
-            "artifacts": self.store.artifacts(self.project_id),
-            "notes": self.store.notes(self.project_id),
-            "instruction": (
-                "The execution budget is exhausted. Perform a final evidence review and conclude, or explain what requires more budget."
-                if exhausted
-                else "Review any unreviewed iteration evidence, then choose the most useful next step."
-            ),
-        }
+        instruction = (
+            "The execution budget is exhausted. Perform a final evidence review and conclude, or explain what requires more budget."
+            if exhausted
+            else "Review any unreviewed iteration evidence, then choose the most useful next step."
+        )
+        project_record = {key: value for key, value in project.items() if key != "snapshot"}
+        artifacts = self.store.artifacts(self.project_id)
+        notes = self.store.notes(self.project_id)
+        if latest is None:
+            packet = {
+                "project": project_record,
+                "history": history_summary,
+                "latest": None,
+                "artifacts": artifacts,
+                "notes": notes,
+                "instruction": instruction,
+            }
+            session_name = "upper.json"
+        else:
+            review_root = self.store.project_dir(self.project_id) / "reviews" / f"{latest['number']:04d}"
+            review_root.mkdir(parents=True, exist_ok=True, mode=0o770)
+            for name, value in (
+                ("project.json", project_record),
+                ("history.json", history_summary),
+                ("notes.json", notes),
+                ("artifacts.json", artifacts),
+            ):
+                atomic_json(review_root / name, value)
+            for item in history:
+                atomic_json(review_root / f"iteration-{item['number']:04d}.json", item)
+            relative = review_root.relative_to(self.store.project_dir(self.project_id)).as_posix()
+            packet = {
+                "project": {
+                    "name": project["name"],
+                    "goal_preview": project["goal"][:1000],
+                    "goal_truncated": len(project["goal"]) > 1000,
+                },
+                "latest": {
+                    "number": latest["number"],
+                    "status": latest["status"],
+                    "error": latest["error"],
+                    "subgoal_preview": latest["definition"]["subgoal"][:500],
+                    "report_outcome": (latest["report"] or {}).get("outcome"),
+                },
+                "review_files": {
+                    "project": f"{relative}/project.json",
+                    "history": f"{relative}/history.json",
+                    "latest_iteration": f"{relative}/iteration-{latest['number']:04d}.json",
+                    "prior_iterations": f"{relative}/iteration-NNNN.json",
+                    "notes": f"{relative}/notes.json",
+                    "artifacts": f"{relative}/artifacts.json",
+                },
+                "workspace": f"iterations/{latest['number']:04d}/workspace",
+                "notes_count": len(notes),
+                "artifacts_count": len(artifacts),
+                "instruction": instruction,
+            }
+            session_name = f"upper-review-{latest['number']}"
         prompt = COMMON_PROMPT + "\n" + UPPER_PROMPT + self._skills("upper")
         try:
             await self._phase(
@@ -248,7 +295,7 @@ class Controller:
                 scratch,
                 prompt,
                 json.dumps(packet, separators=(",", ":")),
-                self.store.private_dir(self.project_id) / "sessions" / "upper.json",
+                self.store.private_dir(self.project_id) / "sessions" / f"{session_name}.json",
                 choose=choice,
             )
         except TimeoutError:

@@ -49,6 +49,9 @@ def test_api_creates_and_reads_project(config, tmp_path: Path) -> None:
                 }
             )
         )
+        (sessions / "upper-review-1.json").write_text(
+            json.dumps({"usage": {"model": "test-model", "input_tokens": 40, "output_tokens": 10}})
+        )
         store.event(
             project_id,
             "model_request_started",
@@ -73,11 +76,14 @@ def test_api_creates_and_reads_project(config, tmp_path: Path) -> None:
         assert status.json()["project"]["name"] == "api study"
         usage = status.json()["model_usage"]
         assert usage["totals"] == {
-            "input_tokens": 120,
-            "output_tokens": 30,
-            "total_tokens": 150,
+            "input_tokens": 160,
+            "output_tokens": 40,
+            "total_tokens": 200,
             "compactions": 1,
         }
+        review = next(item for item in usage["sessions"] if item["session"] == "upper-review-1")
+        assert review["role"] == "upper"
+        assert review["iteration"] == 1
         assert usage["activity"]["state"] == "idle"
         assert usage["activity"]["latest_request"]["data"][
             "effective_output_tokens_per_second"

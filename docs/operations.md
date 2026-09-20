@@ -8,7 +8,9 @@ unit, and starts the daemon as `rh-agent`. It does not delete the v0.1 source
 checkout under `~/llms`.
 
 First copy `config/example.json` to a private local file and set the actual model
-endpoint and model ID. Then run:
+endpoint and model ID. The model endpoint must support
+`POST /v1/chat/completions/input_tokens` (as the deployed llama.cpp server does).
+Then run:
 
 ```sh
 sudo /home/omega/llms/iterative_research_harness/deploy/bootstrap-root.sh \

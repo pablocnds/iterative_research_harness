@@ -85,8 +85,9 @@ def model_usage(store: Store, project_id: str, controller_active: bool) -> dict[
     sessions: list[dict[str, Any]] = []
     directory = store.private_dir(project_id) / "sessions"
     for path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
-        match = re.fullmatch(r"iteration-(\d+)", path.stem)
-        if path.stem != "upper" and match is None:
+        iteration_match = re.fullmatch(r"iteration-(\d+)", path.stem)
+        review_match = re.fullmatch(r"upper-review-(\d+)", path.stem)
+        if path.stem != "upper" and iteration_match is None and review_match is None:
             continue
         try:
             usage = json.loads(path.read_text()).get("usage", {})
@@ -98,8 +99,8 @@ def model_usage(store: Store, project_id: str, controller_active: bool) -> dict[
         sessions.append(
             {
                 "session": path.stem,
-                "role": "upper" if path.stem == "upper" else "iteration",
-                "iteration": int(match.group(1)) if match is not None else None,
+                "role": "iteration" if iteration_match is not None else "upper",
+                "iteration": int(match.group(1)) if (match := iteration_match or review_match) else None,
                 "model": usage.get("model") if isinstance(usage.get("model"), str) else None,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,

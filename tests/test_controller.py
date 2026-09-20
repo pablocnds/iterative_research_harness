@@ -14,7 +14,15 @@ import irh.agent
 from irh.config import ExternalToolConfig
 from irh.controller import Controller
 from irh.store import Store
-from irh.types import ProjectCreate
+from irh.types import IterationDefinition, ProjectCreate
+
+
+@pytest.fixture(autouse=True)
+def fake_token_count(monkeypatch) -> None:
+    async def count(_self, _request):
+        return 10
+
+    monkeypatch.setattr(irh.agent.AgentSession, "_count_tokens", count)
 
 
 class FakeCall:
@@ -136,6 +144,8 @@ async def test_complete_research_loop_with_hashed_artifact(config, monkeypatch) 
     assert all(event["data"]["ok"] for event in finishes)
     assert sum(event["data"]["input_tokens"] for event in finishes) == 30
     assert sum(event["data"]["output_tokens"] for event in finishes) == 15
+    review_session = store.private_dir(project["id"]) / "sessions" / "upper-review-1.json"
+    assert review_session.is_file()
     store.close()
 
 
@@ -192,4 +202,39 @@ async def test_model_request_failure_pauses_for_intervention(config, monkeypatch
     model_finished = next(event for event in events if event["kind"] == "model_request_finished")
     assert model_finished["data"]["ok"] is False
     assert model_finished["data"]["error_type"] == "APITimeoutError"
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_starts_fresh_with_evidence_available_on_demand(config, monkeypatch) -> None:
+    store = Store(config.data_root)
+    project = store.create_project(
+        ProjectCreate(name="study", goal="evaluate evidence"),
+        {"enabled_tools": [], "skills": {"upper": [], "iteration": []}},
+        600,
+    )
+    definition = IterationDefinition(
+        subgoal="short subgoal", hypothesis="hypothesis", introduction="x" * 20_000
+    )
+    store.define_iteration(project["id"], definition, 120)
+    store.finish_iteration(project["id"], 1, "timeout", None, "time limit")
+    store.record_note(project["id"], "n" * 20_000)
+    captured = {}
+
+    async def capture_phase(self, role, seconds, workspace, scratch, system_prompt, prompt, session_path, **_):
+        captured.update(role=role, prompt=prompt, session_path=session_path)
+        return {}
+
+    monkeypatch.setattr(Controller, "_phase", capture_phase)
+    await Controller(config, store, project["id"])._upper()
+    packet = json.loads(captured["prompt"])
+    assert captured["role"] == "upper"
+    assert captured["session_path"].name == "upper-review-1.json"
+    assert len(captured["prompt"]) < 2_000
+    assert packet["latest"]["status"] == "timeout"
+    root = store.project_dir(project["id"])
+    assert json.loads((root / packet["review_files"]["latest_iteration"]).read_text())[
+        "definition"
+    ]["introduction"] == "x" * 20_000
+    assert json.loads((root / packet["review_files"]["notes"]).read_text())[0]["text"] == "n" * 20_000
     store.close()

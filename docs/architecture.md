@@ -40,10 +40,16 @@ inference, identify units and uncertainty, and run the smallest useful test
 before expensive work. The upper role reviews actual evidence and uses `decide`.
 The iteration role executes one definition and uses `submit_results`.
 
-Sessions are stored as JSON and resumed for the upper agent and a controlled
-iteration continuation. When estimated context approaches the configured
-window, the model creates a compact continuation summary while retaining recent
-turns. Tool calls and per-request model timing/token usage are recorded as
+Sessions are stored as JSON. Planning and each upper review have separate
+sessions; a resumed iteration reuses its session without repeating the unchanged
+definition. Reviews begin with a small index and can inspect full project,
+iteration, notes, artifact, and workspace evidence through the read-only project
+view. Before each model request, the harness asks the model's
+`/v1/chat/completions/input_tokens` endpoint for the complete prompt size. The
+existing context threshold is unchanged; when reached, the model creates a
+compact continuation summary while retaining recent turns. Tool results are
+included only once, and large ones are saved to the agent's readable files with
+a bounded preview and path in the conversation. Tool calls and per-request model timing/token usage are recorded as
 append-only SQLite events. Project status exposes aggregate token usage without
 exposing the private session transcript. Reported token rates are effective
 tokens per full request second, including provider queueing and prompt handling;
@@ -51,5 +57,6 @@ they are not a claim about raw decoder throughput.
 
 An unclean daemon loss turns an executing attempt into an explicit interrupted
 attempt and pauses for upper review. A controlled pause preserves the active
-workspace and session. Restarting a paused project always requires an explicit
+workspace and session. Phase timeout or cancellation also cancels any in-flight
+model request. Restarting a paused project always requires an explicit
 resume request.
