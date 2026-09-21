@@ -240,7 +240,7 @@ def phase_tools(
                 ),
                 AgentTool(
                     "decide",
-                    "End this phase by defining the next iteration, requesting a child revision, or concluding the project. For action='revise', definition.parent is required and must identify the reviewed iteration.",
+                    "End this phase by defining the next iteration, requesting a child revision, or concluding the project. Always include definition.parent: the reviewed iteration number for action='revise', or null for action='iterate'.",
                     Decision.model_json_schema(),
                     decide,
                 ),

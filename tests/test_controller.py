@@ -70,6 +70,7 @@ class FakeCompletions:
                         "subgoal": "write one measured result",
                         "hypothesis": "the result can be recorded",
                         "introduction": "deterministic test",
+                        "parent": None,
                         "inputs": [],
                     },
                 }
@@ -235,7 +236,7 @@ async def test_review_sees_only_publication_view(config, monkeypatch) -> None:
         600,
     )
     definition = IterationDefinition(
-        subgoal="short subgoal", hypothesis="hypothesis", introduction="x" * 20_000
+        subgoal="short subgoal", hypothesis="hypothesis", introduction="x" * 20_000, parent=None
     )
     store.define_iteration(project["id"], definition, 60, 120)
     store.finish_iteration(project["id"], 1, "timeout", None, "time limit")

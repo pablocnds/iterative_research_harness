@@ -118,7 +118,12 @@ async def test_timeout_writeup_reuses_session_then_reviews_only_publication(conf
                 {
                     "action": "iterate",
                     "reason": "small test",
-                    "definition": {"subgoal": "measure", "hypothesis": "measurable", "introduction": "test"},
+                    "definition": {
+                        "subgoal": "measure",
+                        "hypothesis": "measurable",
+                        "introduction": "test",
+                        "parent": None,
+                    },
                 }
             )
         elif role == "iteration" and mode == "normal":

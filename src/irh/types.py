@@ -23,9 +23,8 @@ class IterationDefinition(BaseModel):
     requirements: list[str] = Field(default_factory=list)
     milestones: list[str] = Field(default_factory=list)
     parent: int | None = Field(
-        default=None,
         ge=1,
-        description="Required for action='revise': the reviewed iteration number; omit for a new iteration.",
+        description="Always include this key: the reviewed iteration number for action='revise', or null for action='iterate'.",
     )
     time_limit_seconds: float | None = Field(default=None, gt=0)
     inputs: list[InputSelection] = Field(default_factory=list)

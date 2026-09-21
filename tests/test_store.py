@@ -21,6 +21,7 @@ def test_lifecycle_distinguishes_attempt_and_hashes_evidence(config, tmp_path) -
                 "subgoal": "measure one thing",
                 "hypothesis": "it is measurable",
                 "introduction": "small test",
+                "parent": None,
                 "inputs": [],
             },
         }
@@ -41,7 +42,8 @@ def test_lifecycle_distinguishes_attempt_and_hashes_evidence(config, tmp_path) -
 def test_revise_parent_requirement_is_exposed_in_the_tool_schema() -> None:
     schema = Decision.model_json_schema()
     parent = schema["$defs"]["IterationDefinition"]["properties"]["parent"]
-    assert "Required for action='revise'" in parent["description"]
+    assert "Always include this key" in parent["description"]
+    assert "parent" in schema["$defs"]["IterationDefinition"]["required"]
 
 
 def test_pause_and_explicit_resume(config) -> None:
@@ -103,7 +105,12 @@ def test_unclean_iteration_resumes_in_same_session_for_writeup(config) -> None:
             {
                 "action": "iterate",
                 "reason": "test",
-                "definition": {"subgoal": "measure", "hypothesis": "testable", "introduction": "test"},
+                "definition": {
+                    "subgoal": "measure",
+                    "hypothesis": "testable",
+                    "introduction": "test",
+                    "parent": None,
+                },
             }
         ).definition,
         60,
