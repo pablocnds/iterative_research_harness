@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import threading
 import uuid
 from collections.abc import Iterator
@@ -29,8 +30,13 @@ class Store:
     def __init__(self, root: Path):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True, mode=0o770)
-        self.db = sqlite3.connect(root / "state.sqlite3", check_same_thread=False)
-        os.chmod(root / "state.sqlite3", 0o660)
+        database = root / "state.sqlite3"
+        self.db = sqlite3.connect(database, check_same_thread=False)
+        database_stat = database.stat()
+        if database_stat.st_uid == os.geteuid():
+            os.chmod(database, 0o660)
+        elif not database_stat.st_mode & stat.S_IWGRP:
+            raise PermissionError(f"SQLite state is not writable by the service group: {database}")
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
         self.db.executescript(
