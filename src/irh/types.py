@@ -10,8 +10,11 @@ Role = Literal["upper", "iteration"]
 class InputSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    source: str = Field(min_length=1)
-    destination: str = Field(min_length=1)
+    source: str = Field(
+        min_length=1,
+        description="Project-root source path. During paper review, copy the exact prefix supplied in revision_inputs; read_file paths are not source paths.",
+    )
+    destination: str = Field(min_length=1, description="Relative path in the new iteration workspace.")
 
 
 class IterationDefinition(BaseModel):

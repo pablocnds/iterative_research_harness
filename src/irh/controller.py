@@ -33,7 +33,7 @@ Call submit_results with the paper outcome and supplementary paths when finished
 
 WRITEUP_PROMPT = """Execution time has ended. Continue from this same session and finish a sincere, concise paper.md using only existing evidence. State missing results, failed checks, interrupted calls, and pending jobs plainly; do not claim unverified outcomes. You may read existing files, write only paper.md, and submit it with selected existing supplementary files. No further experiments are available."""
 
-REVIEW_PROMPT = """Your role is to plan and review the iteration paper and its selected supplementary files in /project. The raw iteration workspace is not available. Assess what the paper supports, request a targeted revision or more evidence if needed, or define the next bounded iteration. For a revision, select needed files from the packet's revision_inputs as definition.inputs; the full workspace may be selected without inspecting it. Do not reconstruct the whole experiment from source files. Call decide once when ready."""
+REVIEW_PROMPT = """Your role is to plan and review the iteration paper and its selected supplementary files in /project. The raw iteration workspace is not available. Assess what the paper supports, request a targeted revision or more evidence if needed, or define the next bounded iteration. For a revision, select needed files from the packet's revision_inputs as definition.inputs; source values are project-root paths and must retain the exact revision_inputs prefix, which differs from read_file paths. The full workspace may be selected without inspecting it. Do not reconstruct the whole experiment from source files. Call decide once when ready."""
 
 
 class ActiveTimeBudget:

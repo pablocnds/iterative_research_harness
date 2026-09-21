@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import stat
 
 import pytest
 
@@ -10,6 +11,7 @@ from irh.types import Decision, IterationReport, ProjectCreate
 
 def test_lifecycle_distinguishes_attempt_and_hashes_evidence(config, tmp_path) -> None:
     store = Store(config.data_root)
+    assert stat.S_IMODE((config.data_root / "state.sqlite3").stat().st_mode) == 0o660
     project = store.create_project(
         ProjectCreate(name="study", goal="measure"), {"enabled_tools": [], "skills": {}}, 600
     )

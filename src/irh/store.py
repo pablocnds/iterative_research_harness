@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import uuid
@@ -29,6 +30,7 @@ class Store:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True, mode=0o770)
         self.db = sqlite3.connect(root / "state.sqlite3", check_same_thread=False)
+        os.chmod(root / "state.sqlite3", 0o660)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
         self.db.executescript(
