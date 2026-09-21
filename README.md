@@ -1,6 +1,6 @@
 # Iterative Research Harness
 
-A small persistent upper-agent → iteration-agent research loop. One Python
+A small persistent planning → experiment → paper review research loop. One Python
 daemon owns project lifecycle, model sessions, sandboxes, evidence, and all
 mutating control. The CLI is only a client of its HTTP-over-Unix-socket API.
 
@@ -16,10 +16,11 @@ generic tool-dispatch wrapper, GUI, or observer agent.
 - SQLite is the only authority. Events are append-only; status and bounded
   event queries do not rebuild a JSON ledger.
 - Upper and iteration sessions persist separately outside agent-visible project
-  files. Iteration workspaces are fresh unless a controlled pause is resumed.
+  files. A timed-out iteration keeps its session and workspace for a bounded
+  paper-only write-up. A later revision is a new iteration with selected inputs.
 - Selected resources use reflink copies when supported. Completed workspaces
-  are moved into immutable iteration history, and registered artifacts receive
-  SHA-256 hashes.
+  are archived; only paper.md and selected, SHA-256-registered supplementary
+  files enter the upper agent's publication view.
 - Base prompts contain only cross-domain research behavior. Operator-selected
   prompt-only skills and enabled-tool guidance are snapshotted with the project.
 - MCP arguments and results retain their declared schemas. Model-correctable

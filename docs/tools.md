@@ -63,6 +63,17 @@ is never presented as an ordinary agent-fixable failure. Incident resolution is
 not in the role allowlist and remains an operator action against the standalone
 service.
 
+While `wait` is blocked in capacity acquisition, provisioning, staging,
+migration, or output synchronization, the adapter sends private MCP progress
+markers that pause the harness active-time clock. Metered GPU execution and any
+useful local agent work continue to consume harness time. These markers are not
+model-visible and do not add an agent-facing timing API.
+
+During timeout write-up and paper review, external tools are not shown to the
+model. Configured host monitors continue running so infrastructure incidents
+still pause the workflow. An existing asynchronous job may finish late; the
+paper must label results not yet synchronized into its workspace as pending.
+
 The example adapter configuration is in `config/runpod-tool.json`. Its
 `input-root` and `output-root` must exactly match the standalone service config
 and be writable/readable respectively by `rh-agent` (normally via

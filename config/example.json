@@ -21,6 +21,7 @@
   "project_seconds": 604800,
   "iteration_seconds": 28800,
   "max_iteration_seconds": 86400,
+  "writeup_seconds": 3600,
   "upper_seconds": 7200,
   "tools": [
     {

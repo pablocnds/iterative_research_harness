@@ -15,7 +15,14 @@ from starlette.routing import Route
 
 from . import __version__
 from .config import HarnessConfig
-from .controller import COMMON_PROMPT, ITERATION_PROMPT, UPPER_PROMPT, Supervisor
+from .controller import (
+    COMMON_PROMPT,
+    ITERATION_PROMPT,
+    REVIEW_PROMPT,
+    UPPER_PROMPT,
+    WRITEUP_PROMPT,
+    Supervisor,
+)
 from .errors import ConflictError, HarnessError, NotFoundError
 from .store import Store
 from .types import ProjectCreate
@@ -138,7 +145,13 @@ def create_app(
             config.tool(tool_id)
         snapshot = {
             "source": source_identity(),
-            "base_prompts": {"common": COMMON_PROMPT, "upper": UPPER_PROMPT, "iteration": ITERATION_PROMPT},
+            "base_prompts": {
+                "common": COMMON_PROMPT,
+                "upper": UPPER_PROMPT,
+                "iteration": ITERATION_PROMPT,
+                "writeup": WRITEUP_PROMPT,
+                "review": REVIEW_PROMPT,
+            },
             "enabled_tools": value.tools,
             "tool_configurations": [
                 {"id": config.tool(tool_id).id, "configuration_id": config.tool(tool_id).configuration_id}
@@ -163,9 +176,7 @@ def create_app(
                 "project": store.get_project(project_id),
                 "iterations": store.history(project_id),
                 "artifacts": store.artifacts(project_id),
-                "model_usage": model_usage(
-                    store, project_id, task is not None and not task.done()
-                ),
+                "model_usage": model_usage(store, project_id, task is not None and not task.done()),
             }
         )
 

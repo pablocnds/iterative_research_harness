@@ -143,9 +143,7 @@ async def test_iteration_resume_does_not_append_unchanged_definition(config, tmp
         return ToolResult(text="done")
 
     session.terminal = lambda: done
-    session.tools = {
-        "finish": AgentTool("finish", "Finish", {"type": "object", "properties": {}}, finish)
-    }
+    session.tools = {"finish": AgentTool("finish", "Finish", {"type": "object", "properties": {}}, finish)}
 
     async def count(_request):
         return 10
@@ -161,10 +159,38 @@ async def test_iteration_resume_does_not_append_unchanged_definition(config, tmp
                 "function": {"name": "finish", "arguments": "{}"},
             },
         )
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[call]))])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[call]))]
+        )
 
     monkeypatch.setattr(session, "_count_tokens", count)
     monkeypatch.setattr(session, "_complete", complete)
     await session.run("same definition")
     assert sum(m.get("content") == "same definition" for m in seen["messages"]) == 1
+    store.close()
+
+
+def test_resume_closes_interrupted_tool_calls_without_guessing_outcome(config, tmp_path) -> None:
+    session, store = make_session(config, tmp_path)
+    session.messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "done", "type": "function", "function": {"name": "first", "arguments": "{}"}},
+                {"id": "unknown", "type": "function", "function": {"name": "second", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "done", "content": "completed"},
+    ]
+    session._close_interrupted_tool_calls()
+    assert [item["tool_call_id"] for item in session.messages if item["role"] == "tool"] == [
+        "done",
+        "unknown",
+    ]
+    recovered = json.loads(session.messages[-1]["content"])
+    assert recovered["is_error"] is True
+    assert "outcome and side effects are unknown" in recovered["error"]
+    session._close_interrupted_tool_calls()
+    assert len(session.messages) == 3
     store.close()

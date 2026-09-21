@@ -94,6 +94,7 @@ class HarnessConfig(BaseModel):
     project_seconds: int = Field(default=604_800, gt=0)
     iteration_seconds: int = Field(default=28_800, gt=0)
     max_iteration_seconds: int = Field(default=86_400, gt=0)
+    writeup_seconds: int = Field(default=3_600, gt=0)
     upper_seconds: int = Field(default=7_200, gt=0)
 
     @model_validator(mode="after")

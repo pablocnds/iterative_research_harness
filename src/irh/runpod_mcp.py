@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import http.client
 import json
 import os
@@ -15,6 +16,11 @@ from typing import Any
 from urllib.parse import urlencode
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
+
+from .tooling import BUDGET_PAUSE_MESSAGE, BUDGET_RESUME_MESSAGE
+
+UNMETERED_WAIT_STATES = {"queued", "acquiring", "staging", "launching", "syncing"}
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -146,7 +152,7 @@ class RunpodAPI:
 def build_server(api: RunpodAPI) -> MCPServer:
     server = MCPServer(
         "runpod-agent-tool",
-        version="0.1.1",
+        version="0.3.0",
         instructions=(
             "Submit asynchronous GPU jobs with explicit inputs and outputs. Use wait rather than repeated status calls. "
             "Bundle related setup, validation, downloads, and useful work into substantial jobs; avoid short probes."
@@ -180,10 +186,23 @@ def build_server(api: RunpodAPI) -> MCPServer:
         return api.publish_outputs(result) if job_id else result
 
     @server.tool(structured_output=True)
-    def wait(job_id: str, timeout_seconds: float = 60) -> dict[str, Any]:
-        """Wait efficiently for a job state change or completion, for at most 300 seconds."""
+    async def wait(job_id: str, timeout_seconds: float = 60, ctx: Context | None = None) -> dict[str, Any]:
+        """Wait efficiently for a metering-state change or completion, for at most 300 seconds."""
         bounded = min(max(timeout_seconds, 0), 300)
-        return api.publish_outputs(api.call("GET", f"/runs/{job_id}/wait?{urlencode({'timeout': bounded})}"))
+        initial = await asyncio.to_thread(api.call, "GET", f"/runs/{job_id}")
+        unmetered = initial.get("state") in UNMETERED_WAIT_STATES
+        if unmetered and ctx is not None:
+            await ctx.report_progress(0, None, BUDGET_PAUSE_MESSAGE)
+        try:
+            result = await asyncio.to_thread(
+                api.call,
+                "GET",
+                f"/runs/{job_id}/wait?{urlencode({'timeout': bounded})}",
+            )
+        finally:
+            if unmetered and ctx is not None:
+                await ctx.report_progress(1, 1, BUDGET_RESUME_MESSAGE)
+        return api.publish_outputs(result)
 
     @server.tool(structured_output=True)
     def cancel(job_id: str) -> dict[str, Any]:

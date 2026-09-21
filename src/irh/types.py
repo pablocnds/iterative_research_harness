@@ -22,7 +22,11 @@ class IterationDefinition(BaseModel):
     introduction: str = Field(min_length=1)
     requirements: list[str] = Field(default_factory=list)
     milestones: list[str] = Field(default_factory=list)
-    parent: int | None = Field(default=None, ge=1)
+    parent: int | None = Field(
+        default=None,
+        ge=1,
+        description="Required for action='revise': the reviewed iteration number; omit for a new iteration.",
+    )
     time_limit_seconds: float | None = Field(default=None, gt=0)
     inputs: list[InputSelection] = Field(default_factory=list)
 
@@ -51,13 +55,9 @@ class Decision(BaseModel):
 class IterationReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    outcome: Literal["achieved", "infeasible"]
-    results: str = Field(min_length=1)
-    conclusions: str = Field(min_length=1)
-    metrics: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    outcome: Literal["achieved", "infeasible", "partial"]
+    paper: Literal["paper.md"] = "paper.md"
     artifacts: list[str] = Field(default_factory=list)
-    code_revision: str | None = None
-    environment: str | None = None
 
 
 class ProjectCreate(BaseModel):

@@ -42,6 +42,8 @@ class AgentSession:
         tools: list[AgentTool],
         abort: asyncio.Event,
         terminal: Callable[[], bool],
+        project_view: Path | None = None,
+        report_only: bool = False,
     ):
         self.config = config
         self.store = store
@@ -53,6 +55,8 @@ class AgentSession:
         self.tools = {tool.name: tool for tool in tools}
         self.abort = abort
         self.terminal = terminal
+        self.project_view = project_view or store.project_dir(project_id)
+        self.report_only = report_only
         self.api_key = read_secret(config.model.api_key_file)
         self.client = AsyncOpenAI(
             base_url=config.model.base_url.rstrip("/") + "/v1",
@@ -77,6 +81,40 @@ class AgentSession:
             self.session_path,
             {"system_prompt": self.system_prompt, "messages": self.messages, "usage": self.usage},
         )
+
+    def _close_interrupted_tool_calls(self) -> None:
+        """Complete the saved chat protocol without asserting an interrupted tool's outcome."""
+        for index in range(len(self.messages) - 1, -1, -1):
+            message = self.messages[index]
+            if message.get("role") != "assistant":
+                continue
+            calls = message.get("tool_calls") or []
+            answered = {
+                item.get("tool_call_id") for item in self.messages[index + 1 :] if item.get("role") == "tool"
+            }
+            missing = [call["id"] for call in calls if call["id"] not in answered]
+            if missing:
+                for call_id in missing:
+                    self.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": json.dumps(
+                                {
+                                    "is_error": True,
+                                    "error": "Tool call was interrupted before its result was recorded; outcome and side effects are unknown.",
+                                },
+                                separators=(",", ":"),
+                            ),
+                        }
+                    )
+                self.save()
+                self.store.event(
+                    self.project_id,
+                    "interrupted_tool_calls_closed",
+                    {"role": self.role, "call_ids": missing},
+                )
+            return
 
     async def _await_or_abort(self, awaitable: Any) -> Any:
         work = asyncio.create_task(awaitable)
@@ -228,7 +266,9 @@ class AgentSession:
             }
             compact_tokens = await self._count_tokens(compact_request)
             if compact_tokens + compact_request["max_tokens"] >= self.config.model.context_window:
-                raise InterventionRequired("model", {"error": "History is too large for one compaction request"})
+                raise InterventionRequired(
+                    "model", {"error": "History is too large for one compaction request"}
+                )
             response = await self._complete(request_kind="compaction", **compact_request)
             summary = response.choices[0].message.content or "No summary was returned."
             self.messages = [{"role": "user", "content": "Prior-session summary:\n" + summary}, *recent]
@@ -240,14 +280,16 @@ class AgentSession:
     def _tool_payload(self, result: Any) -> str:
         if result.is_error:
             detail = result.structured if result.structured is not None else result.text
-            payload = json.dumps({"is_error": True, "detail": detail}, ensure_ascii=False, separators=(",", ":"))
+            payload = json.dumps(
+                {"is_error": True, "detail": detail}, ensure_ascii=False, separators=(",", ":")
+            )
         elif result.structured is not None:
             payload = json.dumps(result.structured, ensure_ascii=False, separators=(",", ":"))
         else:
             payload = result.text
         if len(payload) <= MAX_TOOL_RESULT_CHARS:
             return payload
-        root = self.workspace if self.role == "iteration" else self.store.project_dir(self.project_id)
+        root = self.workspace if self.role == "iteration" else self.project_view
         relative = Path("tool-results") / f"{uuid.uuid4().hex}.txt"
         target = root / relative
         reject_symlinks(root, target)
@@ -262,7 +304,11 @@ class AgentSession:
                 "characters": len(payload),
                 "full_result_path": relative.as_posix(),
                 "shell_path": f"/{'workspace' if self.role == 'iteration' else 'project'}/{relative.as_posix()}",
-                "inspection_hint": "Use run_command to inspect bounded ranges of shell_path.",
+                "inspection_hint": (
+                    "Use read_file with full_result_path and offset_chars to inspect bounded ranges."
+                    if self.report_only or self.role == "upper"
+                    else "Use read_file with full_result_path and offset_chars, or run_command, to inspect bounded ranges."
+                ),
                 "preview": payload[:8000] + "\n...[middle omitted]...\n" + payload[-2000:],
             },
             ensure_ascii=False,
@@ -270,9 +316,9 @@ class AgentSession:
         )
 
     async def run(self, prompt: str) -> dict[str, Any]:
-        if not (
-            self.role == "iteration"
-            and any(message.get("role") == "user" and message.get("content") == prompt for message in self.messages)
+        self._close_interrupted_tool_calls()
+        if not any(
+            message.get("role") == "user" and message.get("content") == prompt for message in self.messages
         ):
             self.messages.append({"role": "user", "content": prompt})
             self.save()
@@ -295,7 +341,11 @@ class AgentSession:
                 followup = (
                     "Continue, then call decide to end this phase; plain text does not commit a lifecycle decision."
                     if self.role == "upper"
-                    else "Continue working, then call submit_results; plain text does not end the iteration."
+                    else (
+                        "Finish paper.md and call submit_results; no further experiments are available."
+                        if self.report_only
+                        else "Continue working, then call submit_results; plain text does not end the iteration."
+                    )
                 )
                 self.messages.append({"role": "user", "content": followup})
                 self.save()

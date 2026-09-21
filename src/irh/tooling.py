@@ -19,6 +19,8 @@ from .store import Store
 from .types import Role, ToolResult
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
+BUDGET_PAUSE_MESSAGE = "irh:budget-pause"
+BUDGET_RESUME_MESSAGE = "irh:budget-resume"
 
 
 @dataclass(frozen=True)
@@ -67,16 +69,10 @@ class MCPConnection:
             )
             client = Client(params, read_timeout_seconds=300)
         elif isinstance(transport, HttpTransport):
-            headers = {
-                name: _expand(value, self.context) for name, value in transport.headers.items()
-            }
-            headers.update(
-                {name: read_secret(path) for name, path in transport.header_files.items()}
-            )
+            headers = {name: _expand(value, self.context) for name, value in transport.headers.items()}
+            headers.update({name: read_secret(path) for name, path in transport.header_files.items()})
             http = await self._stack.enter_async_context(create_mcp_http_client(headers=headers))
-            stream = streamable_http_client(
-                _expand(transport.url, self.context), http_client=http
-            )
+            stream = streamable_http_client(_expand(transport.url, self.context), http_client=http)
             client = Client(stream, read_timeout_seconds=300)
         else:  # pragma: no cover - Pydantic makes this unreachable
             raise TypeError("Unknown MCP transport")
@@ -99,10 +95,35 @@ class MCPConnection:
             if cursor is None:
                 return tools
 
-    async def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+    async def call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        pause_budget: Callable[[], None] | None = None,
+        resume_budget: Callable[[], None] | None = None,
+    ) -> ToolResult:
         assert self.client is not None
-        async with self.lock:
-            result = await self.client.call_tool(name, arguments)
+        paused = False
+
+        async def progress(_progress: float, _total: float | None, message: str | None) -> None:
+            nonlocal paused
+            if message == BUDGET_PAUSE_MESSAGE and not paused and pause_budget is not None:
+                pause_budget()
+                paused = True
+            elif message == BUDGET_RESUME_MESSAGE and paused and resume_budget is not None:
+                resume_budget()
+                paused = False
+
+        try:
+            async with self.lock:
+                result = await self.client.call_tool(
+                    name,
+                    arguments,
+                    progress_callback=progress if pause_budget is not None else None,
+                )
+        finally:
+            if paused and resume_budget is not None:
+                resume_budget()
         text_parts = [block.text for block in result.content if isinstance(block, TextContent)]
         structured = result.structured_content
         meta = dict(result.meta or {})
@@ -126,6 +147,8 @@ class MCPHub:
         store: Store,
         project_id: str,
         abort: asyncio.Event,
+        pause_budget: Callable[[], None] | None = None,
+        resume_budget: Callable[[], None] | None = None,
     ):
         self.configs = configs
         self.role = role
@@ -133,6 +156,8 @@ class MCPHub:
         self.store = store
         self.project_id = project_id
         self.abort = abort
+        self.pause_budget = pause_budget
+        self.resume_budget = resume_budget
         self.connections: dict[str, MCPConnection] = {}
         self.model_tools: list[AgentTool] = []
         self.monitors: list[asyncio.Task[None]] = []
@@ -172,7 +197,12 @@ class MCPHub:
                         _name=declared.name,
                         _config=config,
                     ) -> ToolResult:
-                        result = await _connection.call(_name, arguments)
+                        result = await _connection.call(
+                            _name,
+                            arguments,
+                            self.pause_budget,
+                            self.resume_budget,
+                        )
                         if _name in _config.pause_on_calls and not result.is_error:
                             raise InterventionRequired(_config.id, result.structured or result.text)
                         return result

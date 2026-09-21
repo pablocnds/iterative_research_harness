@@ -74,6 +74,14 @@ activity. The bounded event feed includes `model_request_started` and
 so a separate local observer can poll by cursor without reading private session
 files or the SQLite database directly.
 
+An iteration submits `paper.md` (Methodology, Results, Conclusions) plus selected
+supplementary files. If execution times out, the same agent session enters a
+paper-only write-up with a separate `writeup_seconds` grace period (default one
+hour); it can read existing files but cannot run new experiments. If the grace
+expires, the project pauses for explicit operator intervention. Reviews see only
+the paper package, not the archived workspace; a targeted revision can select
+additional archived inputs without granting the reviewer raw-file access.
+
 Status and logs need no sudo:
 
 ```sh

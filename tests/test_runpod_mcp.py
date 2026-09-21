@@ -13,10 +13,11 @@ class FakeAPI:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.state = "queued"
 
     def call(self, method: str, path: str, value: dict[str, Any] | None = None) -> dict[str, Any]:
         self.calls.append((method, path, value))
-        return {"job_id": "job-1", "state": "queued"}
+        return {"job_id": "job-1", "state": self.state}
 
     def prepare_inputs(self, inputs: list[str]) -> list[str]:
         return inputs
@@ -36,6 +37,31 @@ async def test_runpod_facade_binds_session_and_exposes_native_operations() -> No
     method, path, value = api.calls[-1]
     assert (method, path) == ("POST", "/runs")
     assert value is not None and value["sessionId"] == "bound-session"
+
+
+@pytest.mark.asyncio
+async def test_runpod_wait_marks_only_unmetered_infrastructure_waits() -> None:
+    api = FakeAPI()
+    messages: list[str | None] = []
+
+    async def progress(_progress: float, _total: float | None, message: str | None) -> None:
+        messages.append(message)
+
+    async with Client(build_server(api)) as client:  # type: ignore[arg-type]
+        await client.call_tool(
+            "wait",
+            {"job_id": "job-1", "timeout_seconds": 0},
+            progress_callback=progress,
+        )
+        assert messages == ["irh:budget-pause", "irh:budget-resume"]
+        messages.clear()
+        api.state = "running"
+        await client.call_tool(
+            "wait",
+            {"job_id": "job-1", "timeout_seconds": 0},
+            progress_callback=progress,
+        )
+        assert messages == []
 
 
 def test_runpod_facade_freezes_inputs_and_publishes_collected_outputs(tmp_path) -> None:

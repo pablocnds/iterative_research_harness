@@ -7,7 +7,7 @@ import pytest
 from irh.errors import ConflictError
 from irh.store import Store
 from irh.types import InputSelection, IterationReport, ProjectCreate
-from irh.workspace import WorkspaceManager
+from irh.workspace import WorkspaceManager, report_files
 
 
 def test_resources_stage_archive_and_hash(config, tmp_path: Path) -> None:
@@ -24,14 +24,24 @@ def test_resources_stage_archive_and_hash(config, tmp_path: Path) -> None:
     )
     assert (workspace / "input.txt").read_text() == "input"
     (workspace / "result.txt").write_text("evidence")
+    (workspace / "unpublished.txt").write_text("private")
+    (workspace / "paper.md").write_text(
+        "# Study\n## Methodology\nMeasured.\n## Results\nOne result.\n## Conclusions\nDone.\n"
+    )
+    report = IterationReport(outcome="achieved", artifacts=["result.txt"])
+    publication = workspaces.publish_report(project["id"], 1, workspace, report)
+    assert (publication / "evidence/paper.md").is_file()
+    assert (publication / "evidence/result.txt").is_file()
+    assert not (publication / "evidence/unpublished.txt").exists()
     archive = workspaces.archive(project["id"], 1)
     artifacts = workspaces.register_report_artifacts(
         project["id"],
         1,
         archive,
-        IterationReport(outcome="achieved", results="done", conclusions="done", artifacts=["result.txt"]),
+        report,
     )
-    assert artifacts[0]["sha256"] == "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e"
+    result = next(item for item in artifacts if item["path"] == "result.txt")
+    assert result["sha256"] == "ee8250fb76e094b34b471f13a73dbbe51d1ae142e9df59d7c0d31ec20f0a0a8e"
     store.close()
 
 
@@ -45,3 +55,12 @@ def test_traversal_is_rejected(config, tmp_path: Path) -> None:
             project["id"], 1, [InputSelection(source="../outside", destination="input")]
         )
     store.close()
+
+
+def test_report_accepts_numbered_required_sections(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "paper.md").write_text(
+        "# Study\n## 2. Methodology\nMethod.\n## 4 Results\nResult.\n## 6) Conclusions\nConclusion.\n"
+    )
+    assert report_files(workspace, IterationReport(outcome="partial")) == ["paper.md"]

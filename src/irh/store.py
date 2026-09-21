@@ -47,7 +47,7 @@ class Store:
               project_id TEXT NOT NULL REFERENCES projects(id), number INTEGER NOT NULL,
               status TEXT NOT NULL, definition_json TEXT NOT NULL, report_json TEXT, review_json TEXT,
               error TEXT, active_seconds REAL NOT NULL DEFAULT 0, resume_allowed INTEGER NOT NULL DEFAULT 0,
-              current_attempt INTEGER NOT NULL DEFAULT 0,
+              current_attempt INTEGER NOT NULL DEFAULT 0, writeup_seconds REAL NOT NULL DEFAULT 0,
               PRIMARY KEY(project_id, number)
             );
             CREATE TABLE IF NOT EXISTS attempts (
@@ -75,6 +75,8 @@ class Store:
               BEGIN SELECT RAISE(ABORT, 'append-only events'); END;
             """
         )
+        if "writeup_seconds" not in {row["name"] for row in self.db.execute("PRAGMA table_info(iterations)")}:
+            self.db.execute("ALTER TABLE iterations ADD COLUMN writeup_seconds REAL NOT NULL DEFAULT 0")
         self.db.commit()
 
     @contextmanager
@@ -128,7 +130,7 @@ class Store:
             )
             self._event(db, project_id, "project_created", {"name": request.name, "budget_seconds": budget})
         directory = self.root / "projects" / project_id
-        for child in ("resources", "iterations"):
+        for child in ("resources", "iterations", "publications"):
             (directory / child).mkdir(parents=True, exist_ok=True, mode=0o770)
         (self.root / "controller" / project_id / "sessions").mkdir(parents=True, exist_ok=True, mode=0o770)
         (directory / "snapshot.json").write_text(json.dumps(snapshot, indent=2) + "\n")
@@ -173,11 +175,19 @@ class Store:
             ).fetchall()
         return [self.get_iteration(project_id, row["number"]) for row in rows]
 
-    def define_iteration(self, project_id: str, definition: IterationDefinition, max_seconds: float) -> int:
+    def define_iteration(
+        self,
+        project_id: str,
+        definition: IterationDefinition,
+        default_seconds: float,
+        max_seconds: float,
+    ) -> int:
         project = self.get_project(project_id)
         if project["phase"] not in ("planning", "review"):
             raise ConflictError(f"Cannot define an iteration during {project['phase']}")
-        seconds = definition.time_limit_seconds or max_seconds
+        seconds = (
+            definition.time_limit_seconds if definition.time_limit_seconds is not None else default_seconds
+        )
         if seconds > max_seconds:
             raise ConflictError("Iteration time limit exceeds configured ceiling")
         if definition.parent is not None:
@@ -230,6 +240,23 @@ class Store:
                     "UPDATE iterations SET active_seconds=active_seconds+? WHERE project_id=? AND number=?",
                     (seconds, project_id, project["current_iteration"]),
                 )
+            elif role == "writeup" and project["current_iteration"]:
+                db.execute(
+                    "UPDATE iterations SET writeup_seconds=writeup_seconds+? WHERE project_id=? AND number=?",
+                    (seconds, project_id, project["current_iteration"]),
+                )
+
+    def begin_writeup(self, project_id: str, number: int, reason: str) -> None:
+        iteration = self.get_iteration(project_id, number)
+        if iteration["status"] != "running":
+            raise ConflictError(f"Cannot begin write-up from {iteration['status']}")
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE iterations SET status='writeup',error=?,resume_allowed=0 WHERE project_id=? AND number=?",
+                (reason, project_id, number),
+            )
+            db.execute("UPDATE projects SET phase='writeup' WHERE id=?", (project_id,))
+            self._event(db, project_id, "writeup_started", {"iteration": number, "reason": reason})
 
     def finish_iteration(
         self,
@@ -267,7 +294,13 @@ class Store:
                 {"iteration": number, "attempt": attempt, "status": status, "error": error},
             )
 
-    def apply_decision(self, project_id: str, decision: Decision, max_iteration_seconds: float) -> int | None:
+    def apply_decision(
+        self,
+        project_id: str,
+        decision: Decision,
+        default_iteration_seconds: float,
+        max_iteration_seconds: float,
+    ) -> int | None:
         project = self.get_project(project_id)
         if project["current_iteration"]:
             with self.transaction() as db:
@@ -294,7 +327,12 @@ class Store:
                 self._event(db, project_id, "project_completed", decision.model_dump(mode="json"))
             return None
         assert decision.definition is not None
-        return self.define_iteration(project_id, decision.definition, max_iteration_seconds)
+        return self.define_iteration(
+            project_id,
+            decision.definition,
+            default_iteration_seconds,
+            max_iteration_seconds,
+        )
 
     def pause(self, project_id: str, reason: str, *, resume_phase: str | None = None) -> None:
         project = self.get_project(project_id)
@@ -418,7 +456,7 @@ class Store:
         """Pause work that was active when the daemon disappeared."""
         recovered: list[str] = []
         for project in self.list_projects():
-            if project["phase"] not in ("planning", "review", "executing"):
+            if project["phase"] not in ("planning", "review", "executing", "writeup"):
                 continue
             # A newly created planning project has no running controller yet.
             with self.lock:
@@ -436,14 +474,12 @@ class Store:
             if resume_phase == "executing" and project["current_iteration"]:
                 iteration = self.get_iteration(project["id"], project["current_iteration"])
                 if iteration["status"] == "running":
-                    self.finish_iteration(
+                    self.begin_writeup(
                         project["id"],
                         project["current_iteration"],
-                        "interrupted",
-                        None,
                         "Harness daemon stopped without completing the active agent phase",
                     )
-                    resume_phase = "review"
+                    resume_phase = "writeup"
             self.pause(project["id"], "Recovered after an unclean daemon stop", resume_phase=resume_phase)
             recovered.append(project["id"])
         return recovered

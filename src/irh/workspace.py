@@ -3,15 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 
 from .errors import ConflictError
 from .store import Store
 from .types import InputSelection, IterationReport
+
+PAPER_SECTIONS = ("Methodology", "Results", "Conclusions")
 
 
 def safe_relative(value: str) -> Path:
@@ -46,6 +50,26 @@ def hash_file(path: Path) -> tuple[str, int]:
             digest.update(block)
             size += len(block)
     return digest.hexdigest(), size
+
+
+def report_files(workspace: Path, report: IterationReport) -> list[str]:
+    paths = [report.paper, *report.artifacts]
+    if len(paths) != len(set(paths)):
+        raise ConflictError("Paper and supplementary artifact paths must be distinct")
+    for relative in paths:
+        target = contained(workspace, relative)
+        reject_symlinks(workspace, target)
+        if not target.is_file() or not stat.S_ISREG(target.stat().st_mode):
+            raise ConflictError(f"Report file is not a regular file: {relative}")
+    paper = (workspace / report.paper).read_text(errors="replace")
+    for section in PAPER_SECTIONS:
+        if not re.search(
+            rf"^#{{1,6}}\s+(?:\d+(?:\.\d+)*[.)]?\s+)?{section}\s*$",
+            paper,
+            flags=re.IGNORECASE | re.MULTILINE,
+        ):
+            raise ConflictError(f"paper.md needs a {section} heading")
+    return paths
 
 
 def manifest_tree(path: Path) -> list[dict[str, object]]:
@@ -156,13 +180,53 @@ class WorkspaceManager:
         if report is None:
             return []
         registered: list[dict[str, object]] = []
-        for relative in report.artifacts:
+        for relative in report_files(archive, report):
             target = contained(archive, relative)
-            reject_symlinks(archive, target)
-            metadata = target.stat()
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ConflictError(f"Artifact is not a regular file: {relative}")
             digest, size = hash_file(target)
             self.store.register_artifact(project_id, number, relative, digest, size)
             registered.append({"path": relative, "sha256": digest, "bytes": size})
         return registered
+
+    def publish_report(self, project_id: str, number: int, archive: Path, report: IterationReport) -> Path:
+        """Expose only the paper and chosen supplements to the upper agent."""
+        files = report_files(archive, report)
+        manifest: dict[str, object] = {"paper": None, "supplementary": []}
+        for relative in files:
+            source = contained(archive, relative)
+            digest, size = hash_file(source)
+            entry = {"path": f"evidence/{relative}", "sha256": digest, "bytes": size}
+            if relative == report.paper:
+                manifest["paper"] = entry
+            else:
+                assert isinstance(manifest["supplementary"], list)
+                manifest["supplementary"].append(entry)
+        root = self.store.project_dir(project_id) / "publications"
+        root.mkdir(parents=True, exist_ok=True, mode=0o770)
+        publication = root / f"{number:04d}"
+        if publication.exists():
+            existing = publication / "manifest.json"
+            if (
+                existing.is_file()
+                and json.loads(existing.read_text()) == manifest
+                and all(
+                    (publication / "evidence" / relative).is_file()
+                    and hash_file(publication / "evidence" / relative)
+                    == hash_file(contained(archive, relative))
+                    for relative in files
+                )
+            ):
+                return publication
+            raise ConflictError(f"Publication already differs for iteration {number}")
+        staging = Path(tempfile.mkdtemp(prefix=f".{number:04d}-", dir=root))
+        try:
+            staging.chmod(0o770)
+            evidence = staging / "evidence"
+            evidence.mkdir(mode=0o770)
+            for relative in files:
+                self._copy_reflink(contained(archive, relative), contained(evidence, relative))
+            (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            os.replace(staging, publication)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+        return publication

@@ -85,9 +85,7 @@ def test_api_creates_and_reads_project(config, tmp_path: Path) -> None:
         assert review["role"] == "upper"
         assert review["iteration"] == 1
         assert usage["activity"]["state"] == "idle"
-        assert usage["activity"]["latest_request"]["data"][
-            "effective_output_tokens_per_second"
-        ] == 15.0
+        assert usage["activity"]["latest_request"]["data"]["effective_output_tokens_per_second"] == 15.0
         events = client.get(f"/v1/projects/{project_id}/events?limit=2")
         assert len(events.json()) == 2
     store.close()

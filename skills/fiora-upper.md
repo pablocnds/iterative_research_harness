@@ -14,5 +14,6 @@
 - Compare at most one or two well-motivated changes at a time on the same
   held-out spectra. Require uncertainty by compound and precursor-removed
   scores where feasible.
-- Check the iteration's artifacts and units directly. Do not accept conclusions
-  based only on the iteration summary.
+- Review the iteration paper and selected supplementary evidence. If a claim is
+  important but insufficiently supported, request a targeted revision with the
+  specific missing detail or artifact instead of reopening the whole workspace.

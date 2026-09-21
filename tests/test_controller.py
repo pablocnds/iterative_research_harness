@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ from openai import APITimeoutError
 
 import irh.agent
 from irh.config import ExternalToolConfig
-from irh.controller import Controller
+from irh.controller import ActiveTimeBudget, Controller
 from irh.store import Store
 from irh.types import IterationDefinition, ProjectCreate
 
@@ -36,6 +37,21 @@ class FakeCall:
             "type": "function",
             "function": {"name": self.function.name, "arguments": self.function.arguments},
         }
+
+
+@pytest.mark.asyncio
+async def test_active_time_budget_does_not_expire_while_paused() -> None:
+    budget = ActiveTimeBudget(0.08)
+    expiry = asyncio.create_task(budget.wait_until_exhausted())
+    await asyncio.sleep(0.03)
+    budget.pause()
+    paused_remaining = budget.remaining()
+    await asyncio.sleep(0.10)
+    assert not expiry.done()
+    assert budget.remaining() == pytest.approx(paused_remaining, abs=0.01)
+    budget.resume()
+    await asyncio.wait_for(expiry, timeout=0.2)
+    assert budget.remaining() == 0
 
 
 class FakeCompletions:
@@ -64,13 +80,18 @@ class FakeCompletions:
             calls = [
                 FakeCall("write", "write_file", {"path": "result.txt", "content": "measured"}),
                 FakeCall(
+                    "paper",
+                    "write_file",
+                    {
+                        "path": "paper.md",
+                        "content": "# Study\n## Methodology\nMeasured one result.\n## Results\nOne result.\n## Conclusions\nThe baseline works.\n",
+                    },
+                ),
+                FakeCall(
                     "submit",
                     "submit_results",
                     {
                         "outcome": "achieved",
-                        "results": "recorded one result",
-                        "conclusions": "the baseline works",
-                        "metrics": {"count": 1},
                         "artifacts": ["result.txt"],
                     },
                 ),
@@ -132,7 +153,7 @@ async def test_complete_research_loop_with_hashed_artifact(config, monkeypatch) 
     final = store.get_project(project["id"])
     assert final["phase"] == "complete"
     assert store.get_iteration(project["id"], 1)["status"] == "achieved"
-    artifact = store.artifacts(project["id"])[0]
+    artifact = next(item for item in store.artifacts(project["id"]) if item["path"] == "result.txt")
     assert artifact["path"] == "result.txt"
     assert len(artifact["sha256"]) == 64
     assert FakeOpenAI.latest_kwargs["max_retries"] == 0
@@ -206,7 +227,7 @@ async def test_model_request_failure_pauses_for_intervention(config, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_review_starts_fresh_with_evidence_available_on_demand(config, monkeypatch) -> None:
+async def test_review_sees_only_publication_view(config, monkeypatch) -> None:
     store = Store(config.data_root)
     project = store.create_project(
         ProjectCreate(name="study", goal="evaluate evidence"),
@@ -216,13 +237,15 @@ async def test_review_starts_fresh_with_evidence_available_on_demand(config, mon
     definition = IterationDefinition(
         subgoal="short subgoal", hypothesis="hypothesis", introduction="x" * 20_000
     )
-    store.define_iteration(project["id"], definition, 120)
+    store.define_iteration(project["id"], definition, 60, 120)
     store.finish_iteration(project["id"], 1, "timeout", None, "time limit")
     store.record_note(project["id"], "n" * 20_000)
     captured = {}
 
-    async def capture_phase(self, role, seconds, workspace, scratch, system_prompt, prompt, session_path, **_):
-        captured.update(role=role, prompt=prompt, session_path=session_path)
+    async def capture_phase(
+        self, role, seconds, workspace, scratch, system_prompt, prompt, session_path, **kwargs
+    ):
+        captured.update(role=role, prompt=prompt, session_path=session_path, **kwargs)
         return {}
 
     monkeypatch.setattr(Controller, "_phase", capture_phase)
@@ -232,9 +255,11 @@ async def test_review_starts_fresh_with_evidence_available_on_demand(config, mon
     assert captured["session_path"].name == "upper-review-1.json"
     assert len(captured["prompt"]) < 2_000
     assert packet["latest"]["status"] == "timeout"
-    root = store.project_dir(project["id"])
-    assert json.loads((root / packet["review_files"]["latest_iteration"]).read_text())[
-        "definition"
-    ]["introduction"] == "x" * 20_000
-    assert json.loads((root / packet["review_files"]["notes"]).read_text())[0]["text"] == "n" * 20_000
+    assert captured["mode"] == "paper_review"
+    view = captured["project_view"]
+    assert view.name == "publications"
+    assert (view / packet["latest"]["manifest"]).is_file()
+    assert (view / "0001/notice.md").is_file()
+    assert not (view / "iterations").exists()
+    assert json.loads((view / packet["review_files"]["notes"]).read_text())[0]["text"] == "n" * 20_000
     store.close()

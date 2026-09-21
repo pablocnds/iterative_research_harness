@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -22,14 +23,65 @@ Distinguish observations, inferences, and hypotheses. Cite the artifact or sourc
 Before substantial time or resource use, choose the smallest useful test, state what outcome would change the plan, and check feasibility. Replan when an assumption fails.
 Do not invent results, measurements, files, or citations. The harness owns lifecycle, time limits, and durable evidence. A terminal tool ends your phase."""
 
-UPPER_PROMPT = """Your role is researcher, planner, and reviewer. Inspect actual iteration evidence before accepting conclusions.
-Project history is mounted read-only at /project. Preserve durable cross-phase findings with record_note.
+UPPER_PROMPT = """Your role is researcher and planner. Project history is mounted read-only at /project.
 Define attainable iterations with a hypothesis and enough context to execute them. Select inputs explicitly; workspaces are not inherited automatically.
 Call decide exactly once when ready to start/revise an iteration or conclude the project."""
 
 ITERATION_PROMPT = """Your role is experimenter and executor. Work toward the supplied iteration definition in /workspace.
-Record reproducible commands and measurements, and preserve useful evidence as workspace files. End when the subgoal is achieved or realistically infeasible.
-Call submit_results exactly once with results, conclusions, metrics, and relative artifact paths."""
+Record reproducible commands and measurements in workspace files. Produce a concise paper.md with Methodology, Results, and Conclusions sections; report failures and incomplete work sincerely. Select only the supplementary files needed to support it.
+Call submit_results with the paper outcome and supplementary paths when finished."""
+
+WRITEUP_PROMPT = """Execution time has ended. Continue from this same session and finish a sincere, concise paper.md using only existing evidence. State missing results, failed checks, interrupted calls, and pending jobs plainly; do not claim unverified outcomes. You may read existing files, write only paper.md, and submit it with selected existing supplementary files. No further experiments are available."""
+
+REVIEW_PROMPT = """Your role is to plan and review the iteration paper and its selected supplementary files in /project. The raw iteration workspace is not available. Assess what the paper supports, request a targeted revision or more evidence if needed, or define the next bounded iteration. For a revision, select needed files from the packet's revision_inputs as definition.inputs; the full workspace may be selected without inspecting it. Do not reconstruct the whole experiment from source files. Call decide once when ready."""
+
+
+class ActiveTimeBudget:
+    """A phase clock that can pause while an agent is blocked by infrastructure."""
+
+    def __init__(self, seconds: float):
+        self.initial = seconds
+        self._remaining = seconds
+        self._last = time.monotonic()
+        self._pause_depth = 0
+        self._changed = asyncio.Event()
+
+    def _settle(self) -> None:
+        now = time.monotonic()
+        if self._pause_depth == 0:
+            self._remaining -= now - self._last
+        self._last = now
+
+    def remaining(self) -> float:
+        self._settle()
+        return max(0.0, self._remaining)
+
+    def consumed(self) -> float:
+        return min(self.initial, max(0.0, self.initial - self.remaining()))
+
+    def pause(self) -> None:
+        self._settle()
+        self._pause_depth += 1
+        self._changed.set()
+
+    def resume(self) -> None:
+        if self._pause_depth == 0:
+            return
+        self._settle()
+        self._pause_depth -= 1
+        self._last = time.monotonic()
+        self._changed.set()
+
+    async def wait_until_exhausted(self) -> None:
+        while self.remaining() > 0:
+            self._changed.clear()
+            if self._pause_depth:
+                await self._changed.wait()
+                continue
+            try:
+                await asyncio.wait_for(self._changed.wait(), timeout=self.remaining())
+            except TimeoutError:
+                pass
 
 
 class Controller:
@@ -59,17 +111,17 @@ class Controller:
             f"--- {skill['name']} ---\n{skill['text']}" for skill in skills
         )
 
-    async def _charge_loop(self, role: Role, done: asyncio.Event) -> None:
-        charged_at = time.monotonic()
+    async def _charge_loop(self, role: Role, done: asyncio.Event, budget: ActiveTimeBudget) -> None:
+        charged = budget.consumed()
         while not done.is_set():
             try:
                 await asyncio.wait_for(done.wait(), timeout=30)
             except TimeoutError:
-                now = time.monotonic()
-                self.store.charge(self.project_id, role, now - charged_at)
-                charged_at = now
-        now = time.monotonic()
-        self.store.charge(self.project_id, role, now - charged_at)
+                current = budget.consumed()
+                self.store.charge(self.project_id, role, current - charged)
+                charged = current
+        current = budget.consumed()
+        self.store.charge(self.project_id, role, current - charged)
 
     async def _phase(
         self,
@@ -82,10 +134,16 @@ class Controller:
         session_path: Path,
         choose: Any = None,
         submit: Any = None,
+        mode: str = "normal",
+        project_view: Path | None = None,
     ) -> dict[str, Any]:
-        deadline = time.monotonic() + seconds
+        budget = ActiveTimeBudget(seconds)
         sandbox = Sandbox(
-            role, workspace, scratch, self.store.project_dir(self.project_id), self.config.sandbox
+            role,
+            workspace,
+            scratch,
+            project_view or self.store.project_dir(self.project_id),
+            self.config.sandbox,
         )
         context = {
             "project_id": self.project_id,
@@ -94,17 +152,26 @@ class Controller:
             "iteration": str(self.store.get_project(self.project_id)["current_iteration"]),
         }
         done = asyncio.Event()
-        charge = asyncio.create_task(self._charge_loop(role, done))
-        self.store.event(self.project_id, "agent_started", {"role": role, "seconds": seconds})
+        charge = asyncio.create_task(
+            self._charge_loop("writeup" if mode == "writeup" else role, done, budget)
+        )
+        self.store.event(self.project_id, "agent_started", {"role": role, "mode": mode, "seconds": seconds})
         try:
             async with MCPHub(
-                self._tool_configs(), role, context, self.store, self.project_id, self.abort
+                [tool for tool in self._tool_configs() if mode == "normal" or tool.monitor is not None],
+                role,
+                context,
+                self.store,
+                self.project_id,
+                self.abort,
+                budget.pause,
+                budget.resume,
             ) as hub:
                 self.store.event(
                     self.project_id, "tool_configuration_resolved", {"role": role, "servers": hub.snapshot}
                 )
                 prompt_with_guidance = system_prompt
-                if hub.guidance:
+                if mode == "normal" and hub.guidance:
                     prompt_with_guidance += "\n\nEnabled external-tool guidance:\n" + hub.guidance
                 choose_callback = (
                     (lambda value: setattr(choose, "value", value)) if choose is not None else None
@@ -117,9 +184,10 @@ class Controller:
                     sandbox,
                     self.store,
                     self.project_id,
-                    deadline,
+                    budget.remaining,
                     choose_callback,
                     submit_callback,
+                    mode=mode,
                 )
                 terminal = (
                     (lambda: choose is not None and choose.value is not None)
@@ -134,17 +202,33 @@ class Controller:
                     workspace,
                     session_path,
                     prompt_with_guidance,
-                    [*internal, *hub.model_tools],
+                    [*internal, *(hub.model_tools if mode == "normal" else [])],
                     self.abort,
                     terminal,
+                    project_view=sandbox.project,
+                    report_only=mode == "writeup",
                 )
+                session_task = asyncio.create_task(session.run(prompt))
+                expiry_task = asyncio.create_task(budget.wait_until_exhausted())
                 try:
-                    async with asyncio.timeout(seconds):
-                        usage = await session.run(prompt)
+                    completed, _pending = await asyncio.wait(
+                        (session_task, expiry_task), return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if session_task in completed:
+                        usage = await session_task
+                    else:
+                        session_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await session_task
+                        raise TimeoutError
                 except asyncio.CancelledError:
                     if hub.incident:
                         raise hub.incident
                     raise
+                finally:
+                    expiry_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await expiry_task
                 if hub.incident:
                     raise hub.incident
                 return usage
@@ -169,6 +253,8 @@ class Controller:
                     break
                 if project["phase"] == "executing":
                     await self._iterate()
+                elif project["phase"] == "writeup":
+                    await self._writeup()
                 else:
                     await self._upper()
         except InterventionRequired as error:
@@ -225,6 +311,11 @@ class Controller:
                 "subgoal": item["definition"]["subgoal"],
                 "parent": item["definition"].get("parent"),
                 "reviewed": item["review"] is not None,
+                "paper": (
+                    f"{item['number']:04d}/evidence/{item['report']['paper']}"
+                    if item["report"] and item["report"].get("paper")
+                    else None
+                ),
             }
             for item in history
         ]
@@ -234,31 +325,36 @@ class Controller:
             else "Review any unreviewed iteration evidence, then choose the most useful next step."
         )
         project_record = {key: value for key, value in project.items() if key != "snapshot"}
-        artifacts = self.store.artifacts(self.project_id)
         notes = self.store.notes(self.project_id)
         if latest is None:
             packet = {
                 "project": project_record,
                 "history": history_summary,
                 "latest": None,
-                "artifacts": artifacts,
                 "notes": notes,
                 "instruction": instruction,
             }
             session_name = "upper.json"
+            project_view = self.store.project_dir(self.project_id)
         else:
-            review_root = self.store.project_dir(self.project_id) / "reviews" / f"{latest['number']:04d}"
-            review_root.mkdir(parents=True, exist_ok=True, mode=0o770)
+            project_view = self.store.project_dir(self.project_id) / "publications"
+            project_view.mkdir(parents=True, exist_ok=True, mode=0o770)
             for name, value in (
                 ("project.json", project_record),
                 ("history.json", history_summary),
                 ("notes.json", notes),
-                ("artifacts.json", artifacts),
             ):
-                atomic_json(review_root / name, value)
-            for item in history:
-                atomic_json(review_root / f"iteration-{item['number']:04d}.json", item)
-            relative = review_root.relative_to(self.store.project_dir(self.project_id)).as_posix()
+                atomic_json(project_view / name, value)
+            publication = project_view / f"{latest['number']:04d}"
+            if not publication.exists():
+                publication.mkdir(parents=True, mode=0o770)
+                (publication / "notice.md").write_text(
+                    "No iteration paper is available. This iteration ended before the paper workflow was installed "
+                    "or before a valid paper was submitted. Request a targeted revision if more evidence is needed.\n"
+                )
+                atomic_json(publication / "manifest.json", {"paper": None, "supplementary": []})
+            else:
+                publication.chmod(0o770)
             packet = {
                 "project": {
                     "name": project["name"],
@@ -271,22 +367,22 @@ class Controller:
                     "error": latest["error"],
                     "subgoal_preview": latest["definition"]["subgoal"][:500],
                     "report_outcome": (latest["report"] or {}).get("outcome"),
+                    "paper": history_summary[-1]["paper"],
+                    "manifest": f"{latest['number']:04d}/manifest.json",
                 },
                 "review_files": {
-                    "project": f"{relative}/project.json",
-                    "history": f"{relative}/history.json",
-                    "latest_iteration": f"{relative}/iteration-{latest['number']:04d}.json",
-                    "prior_iterations": f"{relative}/iteration-NNNN.json",
-                    "notes": f"{relative}/notes.json",
-                    "artifacts": f"{relative}/artifacts.json",
+                    "project": "project.json",
+                    "history": "history.json",
+                    "notes": "notes.json",
                 },
-                "workspace": f"iterations/{latest['number']:04d}/workspace",
-                "notes_count": len(notes),
-                "artifacts_count": len(artifacts),
+                "revision_inputs": {
+                    "published": f"publications/{latest['number']:04d}/evidence",
+                    "full_workspace_if_needed": f"iterations/{latest['number']:04d}/workspace",
+                },
                 "instruction": instruction,
             }
             session_name = f"upper-review-{latest['number']}"
-        prompt = COMMON_PROMPT + "\n" + UPPER_PROMPT + self._skills("upper")
+        prompt = COMMON_PROMPT + "\n" + (REVIEW_PROMPT if latest else UPPER_PROMPT) + self._skills("upper")
         try:
             await self._phase(
                 "upper",
@@ -297,6 +393,8 @@ class Controller:
                 json.dumps(packet, separators=(",", ":")),
                 self.store.private_dir(self.project_id) / "sessions" / f"{session_name}.json",
                 choose=choice,
+                mode="paper_review" if latest else "normal",
+                project_view=project_view,
             )
         except TimeoutError:
             self.store.pause(self.project_id, "Upper-agent phase timed out", resume_phase=project["phase"])
@@ -311,7 +409,12 @@ class Controller:
                 self.project_id, "Project budget exhausted after final review", resume_phase="review"
             )
             return
-        self.store.apply_decision(self.project_id, choice.value, self.config.max_iteration_seconds)
+        self.store.apply_decision(
+            self.project_id,
+            choice.value,
+            self.config.iteration_seconds,
+            self.config.max_iteration_seconds,
+        )
 
     async def _iterate(self) -> None:
         project = self.store.get_project(self.project_id)
@@ -333,10 +436,7 @@ class Controller:
         remaining_project = project["budget_seconds"] - project["spent_seconds"]
         seconds = min(remaining_iteration, remaining_project)
         if seconds <= 0:
-            archive = self.workspaces.archive(self.project_id, number)
-            self.store.finish_iteration(
-                self.project_id, number, "timeout", None, "Active-time budget exhausted"
-            )
+            self.store.begin_writeup(self.project_id, number, "Active-time budget exhausted")
             return
 
         class Submission:
@@ -356,17 +456,62 @@ class Controller:
                 self.store.private_dir(self.project_id) / "sessions" / f"iteration-{number}.json",
                 submit=submission,
             )
-            status = submission.value.outcome if submission.value else "failed"
-            error = None if submission.value else "Iteration agent returned without submit_results"
         except TimeoutError:
-            status, error = "timeout", "Iteration active-time limit reached"
-        archive = self.workspaces.archive(self.project_id, number)
+            self.store.begin_writeup(self.project_id, number, "Iteration active-time limit reached")
+            return
+        if submission.value is None:
+            self.store.begin_writeup(self.project_id, number, "Iteration ended without submitting a paper")
+            return
+        self._finish_with_paper(number, workspace, submission.value, submission.value.outcome, None)
+
+    def _finish_with_paper(
+        self, number: int, workspace: Path, report: IterationReport, status: str, error: str | None
+    ) -> None:
+        self.workspaces.publish_report(self.project_id, number, workspace, report)
+        self.workspaces.register_report_artifacts(self.project_id, number, workspace, report)
+        self.workspaces.archive(self.project_id, number)
+        self.store.finish_iteration(self.project_id, number, status, report, error)
+
+    async def _writeup(self) -> None:
+        project = self.store.get_project(self.project_id)
+        number = project["current_iteration"]
+        iteration = self.store.get_iteration(self.project_id, number)
+        if iteration["status"] != "writeup":
+            raise ConflictError(f"Iteration cannot write up from {iteration['status']}")
+        workspace = self.store.runtime_dir(self.project_id) / "iteration" / "workspace"
+        if not workspace.is_dir():
+            raise ConflictError("Write-up workspace is missing")
+        seconds = self.config.writeup_seconds - iteration["writeup_seconds"]
+        if seconds <= 0:
+            self.store.pause(self.project_id, "Write-up grace exhausted", resume_phase="writeup")
+            return
+
+        class Submission:
+            value: IterationReport | None = None
+
+        submission = Submission()
+        prompt = f"{WRITEUP_PROMPT}\nExecution ended because: {iteration['error']}"
         try:
-            self.workspaces.register_report_artifacts(self.project_id, number, archive, submission.value)
-        except Exception as artifact_error:  # noqa: BLE001 - convert registration failures to lifecycle state
-            submission.value = None
-            status, error = "failed", f"Artifact registration failed: {artifact_error}"
-        self.store.finish_iteration(self.project_id, number, status, submission.value, error)
+            await self._phase(
+                "iteration",
+                seconds,
+                workspace,
+                self.store.runtime_dir(self.project_id) / "iteration" / "scratch",
+                COMMON_PROMPT + "\n" + WRITEUP_PROMPT,
+                prompt,
+                self.store.private_dir(self.project_id) / "sessions" / f"iteration-{number}.json",
+                submit=submission,
+                mode="writeup",
+            )
+        except TimeoutError:
+            self.store.pause(self.project_id, "Write-up grace exhausted", resume_phase="writeup")
+            return
+        if submission.value is None:
+            self.store.pause(self.project_id, "Iteration returned without a paper", resume_phase="writeup")
+            return
+        reason = iteration["error"]
+        status = "interrupted" if reason and "daemon stopped" in reason else "timeout"
+        self._finish_with_paper(number, workspace, submission.value, status, reason)
 
 
 class Supervisor:
