@@ -82,9 +82,7 @@ async def test_monitor_uses_a_connection_separate_from_model_calls(config, monke
 
         async def list_tools(self):
             return [
-                SimpleNamespace(
-                    name="work", description="work", title=None, input_schema={"type": "object"}
-                ),
+                SimpleNamespace(name="work", description="work", title=None, input_schema={"type": "object"}),
                 SimpleNamespace(
                     name="health", description="health", title=None, input_schema={"type": "object"}
                 ),
