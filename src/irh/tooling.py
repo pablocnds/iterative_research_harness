@@ -160,6 +160,7 @@ class MCPHub:
         self.resume_budget = resume_budget
         self.connections: dict[str, MCPConnection] = {}
         self.monitor_connections: list[MCPConnection] = []
+        self.opened_connections: list[MCPConnection] = []
         self.model_tools: list[AgentTool] = []
         self.monitors: list[asyncio.Task[None]] = []
         self.incident: InterventionRequired | None = None
@@ -170,6 +171,7 @@ class MCPHub:
             for config in self.configs:
                 connection = MCPConnection(config, self.context)
                 await connection.open()
+                self.opened_connections.append(connection)
                 self.connections[config.id] = connection
                 all_tools = await connection.list_tools()
                 allowed = set(config.roles.get(self.role, []))
@@ -231,6 +233,7 @@ class MCPHub:
                         raise ValueError(f"Monitor tool is absent from {config.id}: {config.monitor.tool}")
                     monitor_connection = MCPConnection(config, self.context)
                     await monitor_connection.open()
+                    self.opened_connections.append(monitor_connection)
                     self.monitor_connections.append(monitor_connection)
                     self.monitors.append(asyncio.create_task(self._monitor(config, monitor_connection)))
             return self
@@ -272,9 +275,7 @@ class MCPHub:
         for task in self.monitors:
             task.cancel()
         await asyncio.gather(*self.monitors, return_exceptions=True)
-        for connection in reversed(list(self.connections.values())):
-            await connection.close()
-        for connection in reversed(self.monitor_connections):
+        for connection in reversed(self.opened_connections):
             await connection.close()
 
     @property

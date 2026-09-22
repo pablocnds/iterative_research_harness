@@ -9,7 +9,7 @@ from .sandbox import Sandbox
 from .store import Store
 from .tooling import AgentTool
 from .types import Decision, IterationReport, Role, ToolResult
-from .workspace import contained, reject_symlinks, report_files
+from .workspace import contained, reject_symlinks, report_files, validate_inputs
 
 EMPTY_OBJECT = {"type": "object", "properties": {}, "additionalProperties": False}
 
@@ -227,6 +227,12 @@ def phase_tools(
         async def decide(arguments: dict[str, Any]) -> ToolResult:
             assert choose is not None
             decision = Decision.model_validate(arguments)
+            if decision.definition is not None:
+                validate_inputs(
+                    store.project_dir(project_id),
+                    store.runtime_dir(project_id) / "iteration" / "workspace",
+                    decision.definition.inputs,
+                )
             choose(decision)
             return ToolResult(text="Decision accepted; this upper-agent phase is complete")
 

@@ -84,6 +84,26 @@ def report_files(workspace: Path, report: IterationReport) -> list[str]:
     return paths
 
 
+def validate_inputs(
+    project: Path, workspace: Path, inputs: Iterable[InputSelection]
+) -> list[tuple[InputSelection, Path, Path]]:
+    """Resolve and validate an iteration's inputs before accepting or staging it."""
+    validated: list[tuple[InputSelection, Path, Path]] = []
+    destinations: list[Path] = []
+    for selection in inputs:
+        source = contained(project, selection.source)
+        reject_symlinks(project, source)
+        if not source.exists() or not (source.is_file() or source.is_dir()):
+            raise ConflictError(f"Selected input does not exist: {selection.source}")
+        destination = contained(workspace, selection.destination)
+        for prior in destinations:
+            if destination == prior or destination.is_relative_to(prior) or prior.is_relative_to(destination):
+                raise ConflictError("Iteration input destinations overlap")
+        destinations.append(destination)
+        validated.append((selection, source, destination))
+    return validated
+
+
 def manifest_tree(path: Path) -> list[dict[str, object]]:
     base = path if path.is_dir() else path.parent
     files = [path] if path.is_file() else sorted(child for child in path.rglob("*") if child.is_file())
@@ -153,29 +173,16 @@ class WorkspaceManager:
         runtime = self.store.runtime_dir(project_id)
         workspace = runtime / "iteration" / "workspace"
         scratch = runtime / "iteration" / "scratch"
+        project = self.store.project_dir(project_id)
+        validated = validate_inputs(project, workspace, inputs)
         if workspace.exists():
             shutil.rmtree(workspace)
         if scratch.exists():
             shutil.rmtree(scratch)
         workspace.mkdir(parents=True, mode=0o770)
         scratch.mkdir(parents=True, mode=0o770)
-        project = self.store.project_dir(project_id)
-        destinations: list[Path] = []
         staged: list[dict[str, str]] = []
-        for selection in inputs:
-            source = contained(project, selection.source)
-            reject_symlinks(project, source)
-            if not source.exists() or not (source.is_file() or source.is_dir()):
-                raise ConflictError(f"Selected input does not exist: {selection.source}")
-            destination = contained(workspace, selection.destination)
-            for prior in destinations:
-                if (
-                    destination == prior
-                    or destination.is_relative_to(prior)
-                    or prior.is_relative_to(destination)
-                ):
-                    raise ConflictError("Iteration input destinations overlap")
-            destinations.append(destination)
+        for selection, source, destination in validated:
             self._copy_reflink(source, destination)
             staged.append({"source": selection.source, "destination": selection.destination})
         self.store.event(project_id, "workspace_staged", {"iteration": number, "inputs": staged})

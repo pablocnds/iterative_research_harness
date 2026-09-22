@@ -89,6 +89,45 @@ async def test_review_can_only_read_publications(config, tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_decide_rejects_missing_iteration_inputs_before_ending_phase(config, tmp_path: Path) -> None:
+    store = Store(config.data_root)
+    project = store.create_project(ProjectCreate(name="study", goal="measure"), {}, 600)
+    sandbox = Sandbox(
+        "upper",
+        tmp_path / "scratch",
+        tmp_path / "scratch",
+        store.project_dir(project["id"]),
+        config.sandbox,
+    )
+    decisions: list[Decision] = []
+    tools = phase_tools(
+        "upper",
+        sandbox,
+        store,
+        project["id"],
+        time.monotonic() + 60,
+        choose=decisions.append,
+    )
+    decide = next(tool for tool in tools if tool.name == "decide")
+    with pytest.raises(ConflictError, match="Selected input does not exist"):
+        await decide.handler(
+            {
+                "action": "iterate",
+                "reason": "continue",
+                "definition": {
+                    "subgoal": "measure",
+                    "hypothesis": "measurable",
+                    "introduction": "test",
+                    "parent": None,
+                    "inputs": [{"source": "notes/plan.md", "destination": "notes/plan.md"}],
+                },
+            }
+        )
+    assert decisions == []
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_timeout_writeup_reuses_session_then_reviews_only_publication(config, monkeypatch) -> None:
     store = Store(config.data_root)
     project = store.create_project(

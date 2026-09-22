@@ -66,6 +66,7 @@ async def test_manual_intervention_is_a_direct_tool_and_pauses(config) -> None:
 @pytest.mark.asyncio
 async def test_monitor_uses_a_connection_separate_from_model_calls(config, monkeypatch) -> None:
     instances = []
+    closed = []
 
     class FakeConnection:
         def __init__(self, _config, _context):
@@ -78,7 +79,7 @@ async def test_monitor_uses_a_connection_separate_from_model_calls(config, monke
             return None
 
         async def close(self):
-            return None
+            closed.append(self.number)
 
         async def list_tools(self):
             return [
@@ -113,4 +114,5 @@ async def test_monitor_uses_a_connection_separate_from_model_calls(config, monke
         assert hub.monitor_connections == [instances[1]]
         assert instances[0].calls == []
         assert instances[1].calls == [("health", {})]
+    assert closed == [1, 0]
     store.close()

@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from irh.errors import ConflictError
 from irh.store import Store
 from irh.types import InputSelection, IterationReport, ProjectCreate
-from irh.workspace import MAX_PAPER_BYTES, WorkspaceManager, report_files
+from irh.workspace import MAX_PAPER_BYTES, WorkspaceManager, report_files, validate_inputs
 
 
 def test_resources_stage_archive_and_hash(config, tmp_path: Path) -> None:
@@ -54,6 +54,41 @@ def test_traversal_is_rejected(config, tmp_path: Path) -> None:
     with pytest.raises(ConflictError):
         WorkspaceManager(store).stage(
             project["id"], 1, [InputSelection(source="../outside", destination="input")]
+        )
+    store.close()
+
+
+def test_inputs_are_validated_without_modifying_an_existing_workspace(config) -> None:
+    store = Store(config.data_root)
+    project = store.create_project(ProjectCreate(name="study", goal="measure"), {}, 600)
+    manager = WorkspaceManager(store)
+    workspace = store.runtime_dir(project["id"]) / "iteration" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "existing.txt").write_text("keep")
+    with pytest.raises(ConflictError, match="Selected input does not exist"):
+        manager.stage(
+            project["id"],
+            1,
+            [InputSelection(source="missing.txt", destination="input.txt")],
+        )
+    assert (workspace / "existing.txt").read_text() == "keep"
+    store.close()
+
+
+def test_input_destinations_cannot_overlap(config) -> None:
+    store = Store(config.data_root)
+    project = store.create_project(ProjectCreate(name="study", goal="measure"), {}, 600)
+    root = store.project_dir(project["id"])
+    (root / "one.txt").write_text("one")
+    (root / "two.txt").write_text("two")
+    with pytest.raises(ConflictError, match="destinations overlap"):
+        validate_inputs(
+            root,
+            store.runtime_dir(project["id"]) / "iteration" / "workspace",
+            [
+                InputSelection(source="one.txt", destination="data"),
+                InputSelection(source="two.txt", destination="data/two.txt"),
+            ],
         )
     store.close()
 
