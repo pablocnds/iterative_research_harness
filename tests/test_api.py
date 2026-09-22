@@ -5,9 +5,10 @@ from pathlib import Path
 
 from starlette.testclient import TestClient
 
-from irh.api import create_app, read_skills
+from irh.api import create_app, model_usage, read_skills
 from irh.controller import Supervisor
 from irh.store import Store
+from irh.types import ProjectCreate
 
 
 def test_skill_source_symlink_is_rejected(tmp_path: Path) -> None:
@@ -22,6 +23,20 @@ def test_skill_source_symlink_is_rejected(tmp_path: Path) -> None:
         assert "non-symlink" in str(error)
     else:
         raise AssertionError("symlinked skill was accepted")
+
+
+def test_model_usage_reads_legacy_initial_upper_session(config) -> None:
+    store = Store(config.data_root)
+    project = store.create_project(ProjectCreate(name="legacy", goal="observe"), {}, 600)
+    sessions = store.private_dir(project["id"]) / "sessions"
+    (sessions / "upper.json.json").write_text(
+        json.dumps({"usage": {"input_tokens": 7, "output_tokens": 3, "compactions": 0}})
+    )
+
+    usage = model_usage(store, project["id"], False)
+    assert usage["totals"]["total_tokens"] == 10
+    assert usage["sessions"][0]["session"] == "upper"
+    store.close()
 
 
 def test_api_creates_and_reads_project(config, tmp_path: Path) -> None:

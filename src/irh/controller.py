@@ -130,6 +130,15 @@ class Controller:
             f"--- {skill['name']} ---\n{skill['text']}" for skill in skills
         )
 
+    def _session_path(self, name: str) -> Path:
+        directory = self.store.private_dir(self.project_id) / "sessions"
+        canonical = directory / f"{name}.json"
+        if name == "upper" and not canonical.exists():
+            legacy = directory / "upper.json.json"
+            if legacy.is_file():
+                return legacy
+        return canonical
+
     async def _charge_loop(self, role: Role, done: asyncio.Event, budget: ActiveTimeBudget) -> None:
         charged = budget.consumed()
         while not done.is_set():
@@ -355,7 +364,7 @@ class Controller:
                 "notes": notes,
                 "instruction": instruction,
             }
-            session_name = "upper.json"
+            session_name = "upper"
             project_view = self.store.project_dir(self.project_id)
         else:
             project_view = self.store.project_dir(self.project_id) / "publications"
@@ -418,7 +427,7 @@ class Controller:
                 scratch,
                 prompt,
                 json.dumps(packet, separators=(",", ":")),
-                self.store.private_dir(self.project_id) / "sessions" / f"{session_name}.json",
+                self._session_path(session_name),
                 choose=choice,
                 mode="paper_review" if latest else "normal",
                 project_view=project_view,
@@ -481,7 +490,7 @@ class Controller:
                 self.store.runtime_dir(self.project_id) / "iteration" / "scratch",
                 prompt,
                 definition_prompt,
-                self.store.private_dir(self.project_id) / "sessions" / f"iteration-{number}.json",
+                self._session_path(f"iteration-{number}"),
                 submit=submission,
             )
         except TimeoutError:
@@ -544,7 +553,7 @@ class Controller:
                 self.store.runtime_dir(self.project_id) / "iteration" / "scratch",
                 prompts["common"] + "\n" + prompts["writeup"],
                 prompt,
-                self.store.private_dir(self.project_id) / "sessions" / f"iteration-{number}.json",
+                self._session_path(f"iteration-{number}"),
                 submit=submission,
                 mode="writeup",
             )

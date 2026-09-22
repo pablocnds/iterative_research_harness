@@ -173,6 +173,21 @@ def test_controller_uses_private_frozen_execution_configuration(config) -> None:
     store.close()
 
 
+def test_initial_upper_session_path_is_canonical_with_legacy_resume(config) -> None:
+    store = Store(config.data_root)
+    project = store.create_project(ProjectCreate(name="session", goal="persist"), {}, 600)
+    controller = Controller(config, store, project["id"])
+    sessions = store.private_dir(project["id"]) / "sessions"
+
+    assert controller._session_path("upper") == sessions / "upper.json"
+    legacy = sessions / "upper.json.json"
+    legacy.write_text("{}")
+    assert controller._session_path("upper") == legacy
+    (sessions / "upper.json").write_text("{}")
+    assert controller._session_path("upper") == sessions / "upper.json"
+    store.close()
+
+
 @pytest.mark.asyncio
 async def test_supervisor_logs_unexpected_controller_failure(config, caplog) -> None:
     store = Store(config.data_root)
@@ -221,6 +236,7 @@ async def test_complete_research_loop_with_hashed_artifact(config, monkeypatch) 
     assert sum(event["data"]["output_tokens"] for event in finishes) == 15
     review_session = store.private_dir(project["id"]) / "sessions" / "upper-review-1.json"
     assert review_session.is_file()
+    assert (store.private_dir(project["id"]) / "sessions" / "upper.json").is_file()
     store.close()
 
 

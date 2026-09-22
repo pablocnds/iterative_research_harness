@@ -93,22 +93,27 @@ def model_usage(store: Store, project_id: str, controller_active: bool) -> dict[
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
     sessions: list[dict[str, Any]] = []
+    seen_sessions: set[str] = set()
     directory = store.private_dir(project_id) / "sessions"
     for path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
-        iteration_match = re.fullmatch(r"iteration-(\d+)", path.stem)
-        review_match = re.fullmatch(r"upper-review-(\d+)", path.stem)
-        if path.stem != "upper" and iteration_match is None and review_match is None:
+        session_name = "upper" if path.name == "upper.json.json" else path.stem
+        iteration_match = re.fullmatch(r"iteration-(\d+)", session_name)
+        review_match = re.fullmatch(r"upper-review-(\d+)", session_name)
+        if session_name != "upper" and iteration_match is None and review_match is None:
+            continue
+        if session_name in seen_sessions:
             continue
         try:
             usage = json.loads(path.read_text()).get("usage", {})
         except (OSError, json.JSONDecodeError):
             continue
+        seen_sessions.add(session_name)
 
         input_tokens = count(usage, "input_tokens")
         output_tokens = count(usage, "output_tokens")
         sessions.append(
             {
-                "session": path.stem,
+                "session": session_name,
                 "role": "iteration" if iteration_match is not None else "upper",
                 "iteration": int(match.group(1)) if (match := iteration_match or review_match) else None,
                 "model": usage.get("model") if isinstance(usage.get("model"), str) else None,
