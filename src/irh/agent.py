@@ -338,6 +338,14 @@ class AgentSession:
             "extra_body": self._extra_body(),
         }
 
+    def _compaction_cut(self) -> int:
+        """Keep a recent suffix without orphaning tool results from their assistant call."""
+        keep = min(8, max(1, len(self.messages) // 2))
+        cut = max(1, len(self.messages) - keep)
+        while cut > 1 and self.messages[cut].get("role") == "tool":
+            cut -= 1
+        return cut
+
     async def compact_if_needed(self, definitions: list[dict[str, Any]]) -> None:
         reserve = min(16_384, self.config.model.context_window // 4)
         threshold = self.config.model.context_window - self.config.model.max_output_tokens - reserve
@@ -346,8 +354,8 @@ class AgentSession:
                 return
             if len(self.messages) < 2:
                 raise InterventionRequired("model", {"error": "Prompt is too large to compact"})
-            keep = min(8, max(1, len(self.messages) // 2))
-            older, recent = self.messages[:-keep], self.messages[-keep:]
+            cut = self._compaction_cut()
+            older, recent = self.messages[:cut], self.messages[cut:]
             compact_request = {
                 "model": self.config.model.model,
                 "messages": [

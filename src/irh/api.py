@@ -25,7 +25,7 @@ from .controller import (
 )
 from .errors import ConflictError, HarnessError, NotFoundError
 from .store import Store
-from .types import ProjectCreate
+from .types import ProjectCreate, ProjectRun
 from .workspace import WorkspaceManager
 
 
@@ -67,8 +67,11 @@ def source_identity() -> dict[str, str | None]:
 def read_skills(paths: list[str]) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     for value in paths:
-        path = Path(value).resolve()
-        if not path.is_file() or path.is_symlink():
+        supplied = Path(value)
+        if supplied.is_symlink():
+            raise ValueError(f"Skill must be a regular non-symlink file: {value}")
+        path = supplied.resolve()
+        if not path.is_file():
             raise ValueError(f"Skill must be a regular non-symlink file: {value}")
         if path.stat().st_size > 128 * 1024:
             raise ValueError(f"Skill exceeds 128 KiB: {value}")
@@ -141,28 +144,38 @@ def create_app(
 
     async def create_project(request: Request) -> JSONResponse:
         value = ProjectCreate.model_validate(await body(request))
-        for tool_id in value.tools:
-            config.tool(tool_id)
+        tools = [config.tool(tool_id) for tool_id in value.tools]
+        prompts = {
+            "common": COMMON_PROMPT,
+            "upper": UPPER_PROMPT,
+            "iteration": ITERATION_PROMPT,
+            "writeup": WRITEUP_PROMPT,
+            "review": REVIEW_PROMPT,
+        }
+        skills = {
+            "upper": read_skills(value.upper_skills),
+            "iteration": read_skills(value.iteration_skills),
+        }
         snapshot = {
             "source": source_identity(),
-            "base_prompts": {
-                "common": COMMON_PROMPT,
-                "upper": UPPER_PROMPT,
-                "iteration": ITERATION_PROMPT,
-                "writeup": WRITEUP_PROMPT,
-                "review": REVIEW_PROMPT,
-            },
+            "base_prompts": prompts,
             "enabled_tools": value.tools,
             "tool_configurations": [
-                {"id": config.tool(tool_id).id, "configuration_id": config.tool(tool_id).configuration_id}
-                for tool_id in value.tools
+                {"id": tool.id, "configuration_id": tool.configuration_id} for tool in tools
             ],
-            "skills": {
-                "upper": read_skills(value.upper_skills),
-                "iteration": read_skills(value.iteration_skills),
-            },
+            "skills": skills,
         }
-        project = store.create_project(value, snapshot, config.project_seconds)
+        execution_snapshot = {
+            "base_prompts": prompts,
+            "tools": [tool.model_dump(mode="json") for tool in tools],
+            "skills": skills,
+        }
+        project = store.create_project(
+            value,
+            snapshot,
+            config.project_seconds,
+            execution_snapshot=execution_snapshot,
+        )
         return json_response(project, 201)
 
     async def list_projects(_request: Request) -> JSONResponse:
@@ -184,17 +197,22 @@ def create_app(
         value = await body(request)
         if not isinstance(value.get("source"), str) or not isinstance(value.get("name"), str):
             raise TypeError("source and name are required strings")
-        result = await __import__("asyncio").to_thread(
-            workspaces.add_resource,
-            request.path_params["project_id"],
-            Path(value["source"]),
-            value["name"],
-        )
+        project_id = request.path_params["project_id"]
+        async with supervisor.lock:
+            task = supervisor.tasks.get(project_id)
+            if task is not None and not task.done():
+                raise ConflictError("Pause the project before adding resources")
+            result = await __import__("asyncio").to_thread(
+                workspaces.add_resource,
+                project_id,
+                Path(value["source"]),
+                value["name"],
+            )
         return json_response(result, 201)
 
     async def run_project(request: Request) -> JSONResponse:
-        value = await body(request)
-        result = await supervisor.start(request.path_params["project_id"], bool(value.get("resume", False)))
+        value = ProjectRun.model_validate(await body(request))
+        result = await supervisor.start(request.path_params["project_id"], value.resume)
         return json_response(result, 202)
 
     async def pause_project(request: Request) -> JSONResponse:
@@ -239,5 +257,13 @@ def create_app(
             Route("/v1/projects/{project_id}/artifacts", artifacts, methods=["GET"]),
             Route("/v1/admin/restart", restart, methods=["POST"]),
         ],
-        exception_handlers={Exception: exception_handler},
+        exception_handlers={
+            NotFoundError: exception_handler,
+            ConflictError: exception_handler,
+            ValidationError: exception_handler,
+            ValueError: exception_handler,
+            TypeError: exception_handler,
+            HarnessError: exception_handler,
+            Exception: exception_handler,
+        },
     )

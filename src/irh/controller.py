@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
 
 from .agent import AgentSession, atomic_json
-from .config import HarnessConfig
+from .config import ExternalToolConfig, HarnessConfig
 from .errors import ConflictError, InterventionRequired
 from .internal_tools import phase_tools
 from .sandbox import Sandbox
@@ -16,6 +17,8 @@ from .store import Store
 from .tooling import MCPHub
 from .types import Decision, InputSelection, IterationReport, Role
 from .workspace import WorkspaceManager
+
+logger = logging.getLogger(__name__)
 
 COMMON_PROMPT = """You are a research agent in a persistent, goal-directed project.
 Use the provided tools according to their descriptions. Tool errors are evidence: inspect them and correct the call when possible.
@@ -28,10 +31,10 @@ Define attainable iterations with a hypothesis and enough context to execute the
 Call decide exactly once when ready to start/revise an iteration or conclude the project."""
 
 ITERATION_PROMPT = """Your role is experimenter and executor. Work toward the supplied iteration definition in /workspace.
-Record reproducible commands and measurements in workspace files. Produce a concise paper.md with Methodology, Results, and Conclusions sections; report failures and incomplete work sincerely. Select only the supplementary files needed to support it.
+Record reproducible commands and measurements in workspace files. Produce a concise paper.md with Methodology, Results, and Conclusions sections; report failures and incomplete work sincerely. Keep paper.md under 4 MiB and select at most 64 supplementary files, each under 2 GiB and at most 8 GiB total.
 Call submit_results with the paper outcome and supplementary paths when finished."""
 
-WRITEUP_PROMPT = """Execution time has ended. Continue from this same session and finish a sincere, concise paper.md using only existing evidence. State missing results, failed checks, interrupted calls, and pending jobs plainly; do not claim unverified outcomes. You may read existing files, write only paper.md, and submit it with selected existing supplementary files. No further experiments are available."""
+WRITEUP_PROMPT = """Execution time has ended. Continue from this same session and finish a sincere, concise paper.md using only existing evidence. State missing results, failed checks, interrupted calls, and pending jobs plainly; do not claim unverified outcomes. You may read existing files, write only paper.md, and submit it with at most 64 selected supplementary files; paper.md must stay under 4 MiB, each supplement under 2 GiB, and the package under 8 GiB. No further experiments are available."""
 
 REVIEW_PROMPT = """Your role is to plan and review the iteration paper and its selected supplementary files in /project. The raw iteration workspace is not available. Assess what the paper supports, request a targeted revision or more evidence if needed, or define the next bounded iteration. For a revision, select needed files from the packet's revision_inputs as definition.inputs; source values are project-root paths and must retain the exact revision_inputs prefix, which differs from read_file paths. The full workspace may be selected without inspecting it. Do not reconstruct the whole experiment from source files. Call decide once when ready."""
 
@@ -98,13 +101,29 @@ class Controller:
         self.abort.set()
 
     def _tool_configs(self) -> list[Any]:
+        execution = self.store.execution_snapshot(self.project_id)
+        frozen = execution.get("tools")
+        if isinstance(frozen, list):
+            return [ExternalToolConfig.model_validate(value) for value in frozen]
         project = self.store.get_project(self.project_id)
-        enabled = project["snapshot"].get("enabled_tools", [])
+        enabled = execution.get("enabled_tools", project["snapshot"].get("enabled_tools", []))
         return [self.config.tool(tool_id) for tool_id in enabled]
+
+    def _base_prompts(self) -> dict[str, str]:
+        execution = self.store.execution_snapshot(self.project_id)
+        prompts = execution.get("base_prompts", {})
+        return {
+            "common": prompts.get("common", COMMON_PROMPT),
+            "upper": prompts.get("upper", UPPER_PROMPT),
+            "iteration": prompts.get("iteration", ITERATION_PROMPT),
+            "writeup": prompts.get("writeup", WRITEUP_PROMPT),
+            "review": prompts.get("review", REVIEW_PROMPT),
+        }
 
     def _skills(self, role: Role) -> str:
         project = self.store.get_project(self.project_id)
-        skills = project["snapshot"].get("skills", {}).get(role, [])
+        execution = self.store.execution_snapshot(self.project_id)
+        skills = execution.get("skills", project["snapshot"].get("skills", {})).get(role, [])
         if not skills:
             return ""
         return "\n\nSelected project skills:\n" + "\n\n".join(
@@ -255,6 +274,8 @@ class Controller:
                     await self._iterate()
                 elif project["phase"] == "writeup":
                     await self._writeup()
+                elif project["phase"] == "finalizing":
+                    self._finalize(project["current_iteration"])
                 else:
                     await self._upper()
         except InterventionRequired as error:
@@ -382,7 +403,13 @@ class Controller:
                 "instruction": instruction,
             }
             session_name = f"upper-review-{latest['number']}"
-        prompt = COMMON_PROMPT + "\n" + (REVIEW_PROMPT if latest else UPPER_PROMPT) + self._skills("upper")
+        prompts = self._base_prompts()
+        prompt = (
+            prompts["common"]
+            + "\n"
+            + (prompts["review"] if latest else prompts["upper"])
+            + self._skills("upper")
+        )
         try:
             await self._phase(
                 "upper",
@@ -443,7 +470,8 @@ class Controller:
             value: IterationReport | None = None
 
         submission = Submission()
-        prompt = COMMON_PROMPT + "\n" + ITERATION_PROMPT + self._skills("iteration")
+        prompts = self._base_prompts()
+        prompt = prompts["common"] + "\n" + prompts["iteration"] + self._skills("iteration")
         definition_prompt = json.dumps(iteration["definition"], separators=(",", ":"))
         try:
             await self._phase(
@@ -462,15 +490,31 @@ class Controller:
         if submission.value is None:
             self.store.begin_writeup(self.project_id, number, "Iteration ended without submitting a paper")
             return
-        self._finish_with_paper(number, workspace, submission.value, submission.value.outcome, None)
+        self._finish_with_paper(number, submission.value, submission.value.outcome, None)
 
     def _finish_with_paper(
-        self, number: int, workspace: Path, report: IterationReport, status: str, error: str | None
+        self, number: int, report: IterationReport, status: str, error: str | None
     ) -> None:
-        self.workspaces.publish_report(self.project_id, number, workspace, report)
-        self.workspaces.register_report_artifacts(self.project_id, number, workspace, report)
-        self.workspaces.archive(self.project_id, number)
-        self.store.finish_iteration(self.project_id, number, status, report, error)
+        self.store.begin_finalization(self.project_id, number, status, report, error)
+        self._finalize(number)
+
+    def _finalize(self, number: int) -> None:
+        iteration = self.store.get_iteration(self.project_id, number)
+        if iteration["status"] != "finalizing" or not iteration["report"]:
+            raise ConflictError(f"Iteration cannot finalize from {iteration['status']}")
+        if not iteration["final_status"]:
+            raise ConflictError("Finalizing iteration has no target status")
+        report = IterationReport.model_validate(iteration["report"])
+        archive = self.workspaces.archive(self.project_id, number)
+        self.workspaces.publish_report(self.project_id, number, archive, report)
+        self.workspaces.register_report_artifacts(self.project_id, number, archive, report)
+        self.store.finish_iteration(
+            self.project_id,
+            number,
+            iteration["final_status"],
+            report,
+            iteration["error"],
+        )
 
     async def _writeup(self) -> None:
         project = self.store.get_project(self.project_id)
@@ -490,14 +534,15 @@ class Controller:
             value: IterationReport | None = None
 
         submission = Submission()
-        prompt = f"{WRITEUP_PROMPT}\nExecution ended because: {iteration['error']}"
+        prompts = self._base_prompts()
+        prompt = f"{prompts['writeup']}\nExecution ended because: {iteration['error']}"
         try:
             await self._phase(
                 "iteration",
                 seconds,
                 workspace,
                 self.store.runtime_dir(self.project_id) / "iteration" / "scratch",
-                COMMON_PROMPT + "\n" + WRITEUP_PROMPT,
+                prompts["common"] + "\n" + prompts["writeup"],
                 prompt,
                 self.store.private_dir(self.project_id) / "sessions" / f"iteration-{number}.json",
                 submit=submission,
@@ -511,7 +556,7 @@ class Controller:
             return
         reason = iteration["error"]
         status = "interrupted" if reason and "daemon stopped" in reason else "timeout"
-        self._finish_with_paper(number, workspace, submission.value, status, reason)
+        self._finish_with_paper(number, submission.value, status, reason)
 
 
 class Supervisor:
@@ -545,8 +590,16 @@ class Supervisor:
 
     def _finished(self, project_id: str, task: asyncio.Task[None]) -> None:
         self.controllers.pop(project_id, None)
+        if self.tasks.get(project_id) is task:
+            self.tasks.pop(project_id, None)
         if not task.cancelled():
-            task.exception()
+            error = task.exception()
+            if error is not None:
+                logger.error(
+                    "Controller task failed for project %s",
+                    project_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
 
     async def pause(self, project_id: str) -> dict[str, Any]:
         controller = self.controllers.get(project_id)

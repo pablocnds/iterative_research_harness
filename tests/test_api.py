@@ -5,9 +5,23 @@ from pathlib import Path
 
 from starlette.testclient import TestClient
 
-from irh.api import create_app
+from irh.api import create_app, read_skills
 from irh.controller import Supervisor
 from irh.store import Store
+
+
+def test_skill_source_symlink_is_rejected(tmp_path: Path) -> None:
+    skill = tmp_path / "skill.md"
+    skill.write_text("instructions")
+    link = tmp_path / "skill-link.md"
+    link.symlink_to(skill)
+
+    try:
+        read_skills([str(link)])
+    except ValueError as error:
+        assert "non-symlink" in str(error)
+    else:
+        raise AssertionError("symlinked skill was accepted")
 
 
 def test_api_creates_and_reads_project(config, tmp_path: Path) -> None:
@@ -30,6 +44,12 @@ def test_api_creates_and_reads_project(config, tmp_path: Path) -> None:
         project = response.json()
         assert project["snapshot"]["skills"]["upper"][0]["text"] == "Use a fixed seed."
         project_id = project["id"]
+        execution = store.execution_snapshot(project_id)
+        assert execution["skills"]["upper"][0]["text"] == "Use a fixed seed."
+        assert execution["base_prompts"]["common"]
+        assert "execution_json" not in project
+        invalid_run = client.post(f"/v1/projects/{project_id}/run", json={"resume": "false"})
+        assert invalid_run.status_code == 400
         added = client.post(
             f"/v1/projects/{project_id}/resources",
             json={"source": str(source), "name": "input.txt"},

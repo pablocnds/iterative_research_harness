@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Role = Literal["upper", "iteration"]
+ReportPath = Annotated[str, Field(min_length=1, max_length=1024)]
 
 
 class InputSelection(BaseModel):
@@ -59,7 +60,7 @@ class IterationReport(BaseModel):
 
     outcome: Literal["achieved", "infeasible", "partial"]
     paper: Literal["paper.md"] = "paper.md"
-    artifacts: list[str] = Field(default_factory=list)
+    artifacts: list[ReportPath] = Field(default_factory=list, max_length=64)
 
 
 class ProjectCreate(BaseModel):
@@ -72,6 +73,12 @@ class ProjectCreate(BaseModel):
     tools: list[str] = Field(default_factory=list)
     upper_skills: list[str] = Field(default_factory=list)
     iteration_skills: list[str] = Field(default_factory=list)
+
+
+class ProjectRun(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resume: bool = Field(default=False, strict=True)
 
 
 class ToolResult(BaseModel):

@@ -13,6 +13,12 @@ again at phase exit; no full ledger projection is rewritten on that path. The
 phase clock can pause through trusted MCP progress markers while an agent is
 blocked by unmetered external infrastructure.
 
+Each project has a public audit snapshot and a separate private execution
+snapshot. The latter freezes its prompts, selected skill text, and complete
+external-tool configuration so a paused project resumes with the same inputs
+after daemon or configuration updates. Credential file contents remain external
+and are read when the tool connection opens.
+
 The project directory contains operator resources, archived workspaces, and a
 separate publication view. Canonical model sessions are under the
 controller-private tree and are not mounted into agent sandboxes. Runtime
@@ -58,7 +64,9 @@ begins with a short index of the paper and supplementary package. Before each
 model request, the harness asks the model's
 `/v1/chat/completions/input_tokens` endpoint for the complete prompt size. The
 existing context threshold is unchanged; when reached, the model creates a
-compact continuation summary while retaining recent turns. Tool results are
+compact continuation summary while retaining recent turns. A compaction boundary
+is moved to the assistant call that began a tool batch, so tool results are never
+retained without their originating call. Tool results are
 included only once, and large ones are saved to the agent's readable files with
 a bounded preview and path in the conversation. Tool calls and per-request model
 timing, token usage, and prompt-cache usage are recorded as append-only SQLite
@@ -69,7 +77,9 @@ tokens per full request second, including provider queueing and prompt handling;
 they are not a claim about raw decoder throughput.
 
 An unclean daemon loss moves an executing attempt to the same paper-only write-up
-path and pauses for explicit operator resume. A controlled pause preserves the
-active workspace and session. Phase timeout or cancellation also cancels any
-in-flight model request. Restarting a paused project always requires an explicit
-resume request.
+path and pauses for explicit operator resume. Accepted papers first enter a
+durable internal finalization phase; archiving, publication, and artifact
+registration are idempotently completed after a restart. A controlled pause
+preserves the active workspace and session. Phase timeout or cancellation also
+cancels any in-flight model request. Restarting a paused project always requires
+an explicit resume request.

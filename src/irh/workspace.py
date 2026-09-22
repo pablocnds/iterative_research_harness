@@ -16,6 +16,9 @@ from .store import Store
 from .types import InputSelection, IterationReport
 
 PAPER_SECTIONS = ("Methodology", "Results", "Conclusions")
+MAX_PAPER_BYTES = 4 * 1024 * 1024
+MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024
+MAX_REPORT_BYTES = 8 * 1024 * 1024 * 1024
 
 
 def safe_relative(value: str) -> Path:
@@ -56,11 +59,20 @@ def report_files(workspace: Path, report: IterationReport) -> list[str]:
     paths = [report.paper, *report.artifacts]
     if len(paths) != len(set(paths)):
         raise ConflictError("Paper and supplementary artifact paths must be distinct")
+    total_size = 0
     for relative in paths:
         target = contained(workspace, relative)
         reject_symlinks(workspace, target)
         if not target.is_file() or not stat.S_ISREG(target.stat().st_mode):
             raise ConflictError(f"Report file is not a regular file: {relative}")
+        size = target.stat().st_size
+        if relative == report.paper and size > MAX_PAPER_BYTES:
+            raise ConflictError("paper.md exceeds the 4 MiB limit")
+        if relative != report.paper and size > MAX_ARTIFACT_BYTES:
+            raise ConflictError(f"Supplementary artifact exceeds the 2 GiB limit: {relative}")
+        total_size += size
+    if total_size > MAX_REPORT_BYTES:
+        raise ConflictError("Paper package exceeds the 8 GiB total limit")
     paper = (workspace / report.paper).read_text(errors="replace")
     for section in PAPER_SECTIONS:
         if not re.search(
@@ -89,25 +101,35 @@ class WorkspaceManager:
         self.store = store
 
     def add_resource(self, project_id: str, source: Path, name: str) -> dict[str, object]:
+        if source.is_symlink():
+            raise ConflictError("Resource must be an existing non-symlink file or directory")
         source = source.resolve()
-        if not source.exists() or source.is_symlink():
+        if not source.exists():
             raise ConflictError("Resource must be an existing non-symlink file or directory")
         destination = contained(self.store.project_dir(project_id) / "resources", name)
-        if destination.exists():
-            raise ConflictError(f"Resource already exists: {name}")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_dir():
-            for child in source.rglob("*"):
-                if child.is_symlink():
-                    raise ConflictError(f"Resource contains a symlink: {child.relative_to(source)}")
-            shutil.copytree(source, destination, symlinks=False)
-        elif source.is_file():
-            shutil.copy2(source, destination)
-        else:
-            raise ConflictError("Special files cannot be resources")
-        manifest = manifest_tree(destination)
-        manifest_path = destination.parent / f".{destination.name}.manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        staging_root = Path(tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent))
+        staged = staging_root / "resource"
+        try:
+            if source.is_dir():
+                for child in source.rglob("*"):
+                    if child.is_symlink():
+                        raise ConflictError(f"Resource contains a symlink: {child.relative_to(source)}")
+                shutil.copytree(source, staged, symlinks=False)
+            elif source.is_file():
+                shutil.copy2(source, staged)
+            else:
+                raise ConflictError("Special files cannot be resources")
+            manifest = manifest_tree(staged)
+            manifest_path = destination.parent / f".{destination.name}.manifest.json"
+            with self.store.resource_lock:
+                if destination.exists() or manifest_path.exists():
+                    raise ConflictError(f"Resource already exists: {name}")
+                os.replace(staged, destination)
+                manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        finally:
+            if staging_root.exists():
+                shutil.rmtree(staging_root)
         self.store.event(
             project_id,
             "resource_added",
@@ -163,15 +185,16 @@ class WorkspaceManager:
         workspace = self.store.runtime_dir(project_id) / "iteration" / "workspace"
         destination = self.store.project_dir(project_id) / "iterations" / f"{number:04d}" / "workspace"
         destination.parent.mkdir(parents=True, exist_ok=True)
+        if not workspace.exists():
+            if destination.is_dir():
+                return destination
+            raise ConflictError("Iteration workspace is missing and has not been archived")
         if destination.exists():
             suffix = 1
             while destination.with_name(f"workspace.attempt-{suffix}").exists():
                 suffix += 1
             destination = destination.with_name(f"workspace.attempt-{suffix}")
-        if workspace.exists():
-            os.replace(workspace, destination)
-        else:
-            destination.mkdir(mode=0o770)
+        os.replace(workspace, destination)
         return destination
 
     def register_report_artifacts(

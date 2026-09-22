@@ -40,6 +40,19 @@ def relative_path(value: str) -> Path:
     return Path(*parsed.parts)
 
 
+def contained_no_symlinks(root: Path, relative: Path, description: str) -> Path:
+    """Resolve an agent-selected path without letting a parent symlink escape its root."""
+    target = root / relative
+    if not target.resolve(strict=False).is_relative_to(root):
+        raise ValueError(f"{description} escapes its root: {relative}")
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"{description} contains a symlink: {relative}")
+    return target
+
+
 class RunpodAPI:
     def __init__(
         self,
@@ -100,9 +113,9 @@ class RunpodAPI:
         prepared: list[str] = []
         for value in inputs:
             relative = relative_path(value)
-            source = self.workspace / relative
-            if not source.exists() or source.is_symlink():
-                raise ValueError(f"Input is missing or symlinked: {value}")
+            source = contained_no_symlinks(self.workspace, relative, "Input")
+            if not source.exists():
+                raise ValueError(f"Input is missing: {value}")
             if source.is_dir() and any(child.is_symlink() for child in source.rglob("*")):
                 raise ValueError(f"Input directory contains a symlink: {value}")
             destination = self.input_root / relative
@@ -130,18 +143,23 @@ class RunpodAPI:
         if not source.is_dir():
             return payload
         destination = self.workspace / "gpu-outputs"
+        destination.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink():
+            raise ValueError("Workspace output directory is symlinked")
         published: list[str] = []
         for child in sorted(source.rglob("*")):
             if child.is_symlink() or not child.is_file():
                 continue
             relative = child.relative_to(source)
-            target = destination / relative
+            target = contained_no_symlinks(destination, relative, "Workspace output")
             target.parent.mkdir(parents=True, exist_ok=True)
+            target = contained_no_symlinks(destination, relative, "Workspace output")
             temporary = target.with_name(f".{target.name}.irh-{uuid.uuid4().hex}")
             subprocess.run(
                 ["/bin/cp", "--reflink=auto", "--preserve=mode,timestamps", str(child), str(temporary)],
                 check=True,
             )
+            contained_no_symlinks(destination, relative, "Workspace output")
             os.replace(temporary, target)
             published.append(str(Path("gpu-outputs") / relative))
         if published:

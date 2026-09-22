@@ -201,6 +201,29 @@ async def test_compaction_uses_existing_96k_threshold_with_exact_count(config, t
     store.close()
 
 
+def test_compaction_never_starts_with_an_orphaned_tool_result(config, tmp_path) -> None:
+    session, store = make_session(config, tmp_path)
+    session.messages = [
+        {"role": "user", "content": "old turn"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "old"}]},
+        {"role": "tool", "tool_call_id": "old", "content": "old result"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "recent"}, {"id": "recent-2"}],
+        },
+        {"role": "tool", "tool_call_id": "recent", "content": "first result"},
+        {"role": "tool", "tool_call_id": "recent-2", "content": "second result"},
+        {"role": "assistant", "content": "continuing"},
+    ]
+
+    cut = session._compaction_cut()
+    assert session.messages[cut]["role"] == "assistant"
+    assert session.messages[cut]["tool_calls"][0]["id"] == "recent"
+    assert session.messages[cut - 1]["role"] == "tool"
+    store.close()
+
+
 @pytest.mark.asyncio
 async def test_iteration_resume_does_not_append_unchanged_definition(config, tmp_path, monkeypatch) -> None:
     session, store = make_session(config, tmp_path)

@@ -134,24 +134,38 @@ class Sandbox:
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
+        limit = self.config.command_output_bytes
+        output = bytearray()
+        clipped = False
+
+        async def drain_output() -> None:
+            nonlocal clipped
+            assert process.stdout is not None
+            while chunk := await process.stdout.read(64 * 1024):
+                output.extend(chunk)
+                overflow = len(output) - limit
+                if overflow > 0:
+                    del output[:overflow]
+                    clipped = True
+
+        drain = asyncio.create_task(drain_output())
         try:
-            output, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            await asyncio.wait_for(process.wait(), timeout=timeout)
         except TimeoutError:
             if process.returncode is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 await process.wait()
+            await drain
             raise TimeoutError("Sandbox command timed out")
         except asyncio.CancelledError:
             if process.returncode is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 await process.wait()
+            await drain
             raise
-        limit = self.config.command_output_bytes
-        clipped = len(output) > limit
-        if clipped:
-            output = output[-limit:]
+        await drain
         return {
             "exit_code": process.returncode,
-            "output": output.decode(errors="replace"),
+            "output": bytes(output).decode(errors="replace"),
             "truncated": clipped,
         }

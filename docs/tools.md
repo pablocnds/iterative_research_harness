@@ -18,9 +18,12 @@ The small harness layer around MCP contains only:
 - an optional hidden monitor tool whose non-null blocked field pauses the run.
 
 MCP server instructions do not silently become general agent instructions. Use
-the concise configured guidance when a model needs usage advice. Configuration,
-resolved server identity, exposed names, and the exact project prompt/skill text
-are recorded for later audit. Secrets do not belong in project snapshots.
+the concise configured guidance when a model needs usage advice. Configuration
+IDs, resolved server identity, exposed names, and the exact project prompt/skill
+text are recorded in the audit snapshot. Complete selected tool configurations
+are kept separately as private execution state. Credential file contents are not
+copied into either snapshot; operators should use secret files rather than
+literal credentials in tool configuration.
 
 ## Manual intervention
 
@@ -57,11 +60,11 @@ iteration workspace, where they can be registered as ordinary harness evidence.
 Provider credentials, provisioning, SSH, billing, migration, transfer retries,
 and incident resolution remain exclusively in `runpod_agent_tool`.
 
-The hidden `host_status` MCP tool is polled by the daemon. A durable Runpod
-incident or loss of its required monitor pauses the full research workflow; it
-is never presented as an ordinary agent-fixable failure. Incident resolution is
-not in the role allowlist and remains an operator action against the standalone
-service.
+The hidden `host_status` MCP tool is polled over a connection dedicated to the
+monitor, separate from model-initiated calls. A durable Runpod incident or loss
+of its required monitor pauses the full research workflow; it is never presented
+as an ordinary agent-fixable failure. Incident resolution is not in the role
+allowlist and remains an operator action against the standalone service.
 
 While `wait` is blocked in capacity acquisition, provisioning, staging,
 migration, or output synchronization, the adapter sends private MCP progress
@@ -78,4 +81,6 @@ The example adapter configuration is in `config/runpod-tool.json`. Its
 `input-root` and `output-root` must exactly match the standalone service config
 and be writable/readable respectively by `rh-agent` (normally via
 `irh-worker`). Add that object to the main configuration's `tools` array before
-creating a project with `--tool runpod`.
+creating a project with `--tool runpod`. The optional adapter rejects symlinks in
+agent-selected input and publication paths before copying across its trusted
+filesystem boundary.

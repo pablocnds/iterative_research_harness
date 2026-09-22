@@ -5,8 +5,11 @@ import stat
 
 import pytest
 
+from irh.controller import Controller
+from irh.errors import ConflictError
 from irh.store import Store
 from irh.types import Decision, IterationReport, ProjectCreate
+from irh.workspace import WorkspaceManager
 
 
 def test_lifecycle_distinguishes_attempt_and_hashes_evidence(config, tmp_path) -> None:
@@ -46,6 +49,35 @@ def test_revise_parent_requirement_is_exposed_in_the_tool_schema() -> None:
     parent = schema["$defs"]["IterationDefinition"]["properties"]["parent"]
     assert "Always include this key" in parent["description"]
     assert "parent" in schema["$defs"]["IterationDefinition"]["required"]
+
+
+def test_apply_decision_enforces_current_iteration_lineage(config) -> None:
+    store = Store(config.data_root)
+    project = store.create_project(ProjectCreate(name="study", goal="measure"), {}, 600)
+
+    def decision(action: str, parent: int | None) -> Decision:
+        return Decision.model_validate(
+            {
+                "action": action,
+                "reason": "next step",
+                "definition": {
+                    "subgoal": "measure",
+                    "hypothesis": "testable",
+                    "introduction": "test",
+                    "parent": parent,
+                },
+            }
+        )
+
+    store.apply_decision(project["id"], decision("iterate", None), 60, 120)
+    store.finish_iteration(project["id"], 1, "partial", IterationReport(outcome="partial"), None)
+    with pytest.raises(ConflictError, match="parent=null"):
+        store.apply_decision(project["id"], decision("iterate", 1), 60, 120)
+    with pytest.raises(ConflictError, match="current reviewed iteration"):
+        store.apply_decision(project["id"], decision("revise", 2), 60, 120)
+    assert store.get_iteration(project["id"], 1)["review"] is None
+    assert store.apply_decision(project["id"], decision("revise", 1), 60, 120) == 2
+    store.close()
 
 
 def test_pause_and_explicit_resume(config) -> None:
@@ -127,6 +159,44 @@ def test_unclean_iteration_resumes_in_same_session_for_writeup(config) -> None:
     store.close()
 
 
+def test_unclean_finalization_recovers_from_the_archived_workspace(config) -> None:
+    store = Store(config.data_root)
+    project = store.create_project(ProjectCreate(name="study", goal="measure"), {}, 600)
+    definition = Decision.model_validate(
+        {
+            "action": "iterate",
+            "reason": "test",
+            "definition": {
+                "subgoal": "measure",
+                "hypothesis": "testable",
+                "introduction": "test",
+                "parent": None,
+            },
+        }
+    ).definition
+    assert definition is not None
+    store.define_iteration(project["id"], definition, 60, 120)
+    workspace = WorkspaceManager(store).stage(project["id"], 1, [])
+    store.start_attempt(project["id"], 1)
+    (workspace / "paper.md").write_text(
+        "# Study\n## Methodology\nMeasured.\n## Results\nPartial.\n## Conclusions\nContinue.\n"
+    )
+    report = IterationReport(outcome="partial")
+    store.event(project["id"], "controller_started", {"resume": False})
+    store.begin_finalization(project["id"], 1, "partial", report, None)
+    WorkspaceManager(store).archive(project["id"], 1)
+    store.close()
+
+    recovered = Store(config.data_root)
+    assert recovered.recover_after_restart() == [project["id"]]
+    assert recovered.get_project(project["id"])["resume_phase"] == "finalizing"
+    recovered.resume(project["id"])
+    Controller(config, recovered, project["id"])._finalize(1)
+    assert recovered.get_iteration(project["id"], 1)["status"] == "partial"
+    assert (recovered.project_dir(project["id"]) / "publications/0001/evidence/paper.md").is_file()
+    recovered.close()
+
+
 def test_existing_database_gains_writeup_counter(config) -> None:
     config.data_root.mkdir(parents=True)
     old = sqlite3.connect(config.data_root / "state.sqlite3")
@@ -143,4 +213,5 @@ def test_existing_database_gains_writeup_counter(config) -> None:
     store = Store(config.data_root)
     columns = {row["name"] for row in store.db.execute("PRAGMA table_info(iterations)")}
     assert "writeup_seconds" in columns
+    assert "final_status" in columns
     store.close()

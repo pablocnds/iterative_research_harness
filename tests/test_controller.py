@@ -13,7 +13,7 @@ from openai import APITimeoutError
 
 import irh.agent
 from irh.config import ExternalToolConfig
-from irh.controller import ActiveTimeBudget, Controller
+from irh.controller import ActiveTimeBudget, Controller, Supervisor
 from irh.store import Store
 from irh.types import IterationDefinition, ProjectCreate
 
@@ -138,6 +138,59 @@ class FailingCompletions:
 class FailingOpenAI:
     def __init__(self, **_kwargs):
         self.chat = SimpleNamespace(completions=FailingCompletions())
+
+
+def test_controller_uses_private_frozen_execution_configuration(config) -> None:
+    frozen_tool = ExternalToolConfig.model_validate(
+        {
+            "id": "example",
+            "configuration_id": "example@frozen",
+            "transport": {"type": "stdio", "command": "/bin/true"},
+            "roles": {"upper": [], "iteration": []},
+        }
+    )
+    live_tool = frozen_tool.model_copy(update={"configuration_id": "example@live"})
+    store = Store(config.data_root)
+    project = store.create_project(
+        ProjectCreate(name="snapshot", goal="remain stable", tools=["example"]),
+        {"enabled_tools": ["example"], "audit_only": "visible"},
+        600,
+        execution_snapshot={
+            "base_prompts": {"common": "frozen common"},
+            "tools": [frozen_tool.model_dump(mode="json")],
+            "skills": {"upper": [{"name": "method", "text": "frozen skill"}], "iteration": []},
+        },
+    )
+    controller = Controller(config.model_copy(update={"tools": [live_tool]}), store, project["id"])
+
+    assert controller._tool_configs()[0].configuration_id == "example@frozen"
+    assert controller._base_prompts()["common"] == "frozen common"
+    assert "frozen skill" in controller._skills("upper")
+    assert store.get_project(project["id"])["snapshot"] == {
+        "enabled_tools": ["example"],
+        "audit_only": "visible",
+    }
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_logs_unexpected_controller_failure(config, caplog) -> None:
+    store = Store(config.data_root)
+    supervisor = Supervisor(config, store)
+
+    async def fail() -> None:
+        raise RuntimeError("unexpected controller failure")
+
+    task = asyncio.create_task(fail())
+    await asyncio.gather(task, return_exceptions=True)
+    supervisor.tasks["project"] = task
+    with caplog.at_level("ERROR", logger="irh.controller"):
+        supervisor._finished("project", task)
+
+    assert "Controller task failed for project project" in caplog.text
+    assert "unexpected controller failure" in caplog.text
+    assert "project" not in supervisor.tasks
+    store.close()
 
 
 @pytest.mark.asyncio

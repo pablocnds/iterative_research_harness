@@ -3,11 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from irh.errors import ConflictError
 from irh.store import Store
 from irh.types import InputSelection, IterationReport, ProjectCreate
-from irh.workspace import WorkspaceManager, report_files
+from irh.workspace import MAX_PAPER_BYTES, WorkspaceManager, report_files
 
 
 def test_resources_stage_archive_and_hash(config, tmp_path: Path) -> None:
@@ -64,3 +65,25 @@ def test_report_accepts_numbered_required_sections(tmp_path: Path) -> None:
         "# Study\n## 2. Methodology\nMethod.\n## 4 Results\nResult.\n## 6) Conclusions\nConclusion.\n"
     )
     assert report_files(workspace, IterationReport(outcome="partial")) == ["paper.md"]
+
+
+def test_report_package_limits_are_enforced(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "paper.md").write_bytes(b"x" * (MAX_PAPER_BYTES + 1))
+    with pytest.raises(ConflictError, match="4 MiB"):
+        report_files(workspace, IterationReport(outcome="partial"))
+    with pytest.raises(ValidationError, match="at most 64 items"):
+        IterationReport(outcome="partial", artifacts=[f"result-{index}" for index in range(65)])
+
+
+def test_resource_source_symlink_is_rejected(config, tmp_path: Path) -> None:
+    store = Store(config.data_root)
+    project = store.create_project(ProjectCreate(name="study", goal="measure"), {}, 600)
+    source = tmp_path / "source.txt"
+    source.write_text("input")
+    link = tmp_path / "link.txt"
+    link.symlink_to(source)
+    with pytest.raises(ConflictError, match="non-symlink"):
+        WorkspaceManager(store).add_resource(project["id"], link, "dataset.txt")
+    store.close()

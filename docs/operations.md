@@ -78,13 +78,15 @@ These warnings are observational and do not pause a project. A separate local
 observer can poll by cursor without reading private session files or the SQLite
 database directly.
 
-An iteration submits `paper.md` (Methodology, Results, Conclusions) plus selected
-supplementary files. If execution times out, the same agent session enters a
-paper-only write-up with a separate `writeup_seconds` grace period (default one
-hour); it can read existing files but cannot run new experiments. If the grace
-expires, the project pauses for explicit operator intervention. Reviews see only
-the paper package, not the archived workspace; a targeted revision can select
-additional archived inputs without granting the reviewer raw-file access.
+An iteration submits `paper.md` (Methodology, Results, Conclusions) plus at most
+64 selected supplementary files. The paper is limited to 4 MiB, each supplement
+to 2 GiB, and the complete package to 8 GiB. If execution times out, the same
+agent session enters a paper-only write-up with a separate `writeup_seconds`
+grace period (default one hour); it can read existing files but cannot run new
+experiments. If the grace expires, the project pauses for explicit operator
+intervention. Reviews see only the paper package, not the archived workspace; a
+targeted revision can select additional archived inputs without granting the
+reviewer raw-file access.
 
 Status and logs need no sudo:
 
@@ -97,3 +99,5 @@ journalctl -u irh-daemon.service
 Paths supplied to `add-resource` and project skill options must be readable by
 `rh-agent`. Place operator-provided files in a shared group-readable location
 when the operator home directory itself is not traversable by that account.
+Resources may be added only while that project is inactive. They are copied and
+hashed in staging, then made visible atomically; symlink sources are rejected.

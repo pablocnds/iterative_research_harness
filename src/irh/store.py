@@ -39,6 +39,7 @@ class Store:
             raise PermissionError(f"SQLite state is not writable by the service group: {database}")
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
+        self.resource_lock = threading.Lock()
         self.db.executescript(
             """
             PRAGMA journal_mode=WAL;
@@ -49,13 +50,15 @@ class Store:
               id TEXT PRIMARY KEY, name TEXT NOT NULL, goal TEXT NOT NULL, guidelines TEXT NOT NULL,
               phase TEXT NOT NULL, resume_phase TEXT, current_iteration INTEGER NOT NULL DEFAULT 0,
               spent_seconds REAL NOT NULL DEFAULT 0, budget_seconds REAL NOT NULL,
-              created_at TEXT NOT NULL, conclusion TEXT, pause_reason TEXT, snapshot_json TEXT NOT NULL
+              created_at TEXT NOT NULL, conclusion TEXT, pause_reason TEXT, snapshot_json TEXT NOT NULL,
+              execution_json TEXT
             );
             CREATE TABLE IF NOT EXISTS iterations (
               project_id TEXT NOT NULL REFERENCES projects(id), number INTEGER NOT NULL,
               status TEXT NOT NULL, definition_json TEXT NOT NULL, report_json TEXT, review_json TEXT,
               error TEXT, active_seconds REAL NOT NULL DEFAULT 0, resume_allowed INTEGER NOT NULL DEFAULT 0,
               current_attempt INTEGER NOT NULL DEFAULT 0, writeup_seconds REAL NOT NULL DEFAULT 0,
+              final_status TEXT,
               PRIMARY KEY(project_id, number)
             );
             CREATE TABLE IF NOT EXISTS attempts (
@@ -85,6 +88,10 @@ class Store:
         )
         if "writeup_seconds" not in {row["name"] for row in self.db.execute("PRAGMA table_info(iterations)")}:
             self.db.execute("ALTER TABLE iterations ADD COLUMN writeup_seconds REAL NOT NULL DEFAULT 0")
+        if "final_status" not in {row["name"] for row in self.db.execute("PRAGMA table_info(iterations)")}:
+            self.db.execute("ALTER TABLE iterations ADD COLUMN final_status TEXT")
+        if "execution_json" not in {row["name"] for row in self.db.execute("PRAGMA table_info(projects)")}:
+            self.db.execute("ALTER TABLE projects ADD COLUMN execution_json TEXT")
         self.db.commit()
 
     @contextmanager
@@ -116,15 +123,20 @@ class Store:
         return self.root / "controller" / project_id
 
     def create_project(
-        self, request: ProjectCreate, snapshot: dict[str, Any], default_budget: float
+        self,
+        request: ProjectCreate,
+        snapshot: dict[str, Any],
+        default_budget: float,
+        execution_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         project_id = str(uuid.uuid4())
         created_at = utcnow()
         budget = request.budget_seconds or default_budget
         with self.transaction() as db:
             db.execute(
-                """INSERT INTO projects(id,name,goal,guidelines,phase,budget_seconds,created_at,snapshot_json)
-                   VALUES(?,?,?,?,?,?,?,?)""",
+                """INSERT INTO projects(
+                     id,name,goal,guidelines,phase,budget_seconds,created_at,snapshot_json,execution_json
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
                 (
                     project_id,
                     request.name,
@@ -134,6 +146,9 @@ class Store:
                     budget,
                     created_at,
                     json.dumps(snapshot, separators=(",", ":")),
+                    json.dumps(execution_snapshot, separators=(",", ":"))
+                    if execution_snapshot is not None
+                    else None,
                 ),
             )
             self._event(db, project_id, "project_created", {"name": request.name, "budget_seconds": budget})
@@ -148,7 +163,17 @@ class Store:
     def _project(row: sqlite3.Row) -> dict[str, Any]:
         value = dict(row)
         value["snapshot"] = decode(value.pop("snapshot_json"))
+        value.pop("execution_json", None)
         return value
+
+    def execution_snapshot(self, project_id: str) -> dict[str, Any]:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT execution_json,snapshot_json FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Unknown project: {project_id}")
+        return decode(row["execution_json"]) or decode(row["snapshot_json"]) or {}
 
     def get_project(self, project_id: str) -> dict[str, Any]:
         with self.lock:
@@ -266,6 +291,38 @@ class Store:
             db.execute("UPDATE projects SET phase='writeup' WHERE id=?", (project_id,))
             self._event(db, project_id, "writeup_started", {"iteration": number, "reason": reason})
 
+    def begin_finalization(
+        self,
+        project_id: str,
+        number: int,
+        status: str,
+        report: IterationReport,
+        error: str | None,
+    ) -> None:
+        iteration = self.get_iteration(project_id, number)
+        if iteration["status"] not in ("running", "writeup"):
+            raise ConflictError(f"Cannot finalize iteration from {iteration['status']}")
+        with self.transaction() as db:
+            db.execute(
+                """UPDATE iterations
+                   SET status='finalizing',final_status=?,report_json=?,error=?,resume_allowed=0
+                   WHERE project_id=? AND number=?""",
+                (
+                    status,
+                    json.dumps(report.model_dump(mode="json"), separators=(",", ":")),
+                    error,
+                    project_id,
+                    number,
+                ),
+            )
+            db.execute("UPDATE projects SET phase='finalizing' WHERE id=?", (project_id,))
+            self._event(
+                db,
+                project_id,
+                "iteration_finalization_started",
+                {"iteration": number, "status": status, "error": error},
+            )
+
     def finish_iteration(
         self,
         project_id: str,
@@ -278,7 +335,7 @@ class Store:
         attempt = iteration["current_attempt"]
         with self.transaction() as db:
             db.execute(
-                """UPDATE iterations SET status=?,report_json=?,error=?,resume_allowed=0
+                """UPDATE iterations SET status=?,report_json=?,error=?,resume_allowed=0,final_status=NULL
                    WHERE project_id=? AND number=?""",
                 (
                     status,
@@ -310,6 +367,20 @@ class Store:
         max_iteration_seconds: float,
     ) -> int | None:
         project = self.get_project(project_id)
+        if project["phase"] not in ("planning", "review"):
+            raise ConflictError(f"Cannot apply a decision during {project['phase']}")
+        if (
+            decision.action == "iterate"
+            and decision.definition is not None
+            and decision.definition.parent is not None
+        ):
+            raise ConflictError("An iterate decision must have definition.parent=null")
+        if decision.action == "revise":
+            if project["phase"] != "review" or not project["current_iteration"]:
+                raise ConflictError("A revision requires a current iteration under review")
+            assert decision.definition is not None
+            if decision.definition.parent != project["current_iteration"]:
+                raise ConflictError("A revision must name the current reviewed iteration as its parent")
         if project["current_iteration"]:
             with self.transaction() as db:
                 db.execute(
@@ -464,7 +535,7 @@ class Store:
         """Pause work that was active when the daemon disappeared."""
         recovered: list[str] = []
         for project in self.list_projects():
-            if project["phase"] not in ("planning", "review", "executing", "writeup"):
+            if project["phase"] not in ("planning", "review", "executing", "writeup", "finalizing"):
                 continue
             # A newly created planning project has no running controller yet.
             with self.lock:

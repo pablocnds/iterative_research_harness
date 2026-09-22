@@ -22,7 +22,8 @@ generic tool-dispatch wrapper, GUI, or observer agent.
   are archived; only paper.md and selected, SHA-256-registered supplementary
   files enter the upper agent's publication view.
 - Base prompts contain only cross-domain research behavior. Operator-selected
-  prompt-only skills and enabled-tool guidance are snapshotted with the project.
+  prompts, skills, and external-tool configuration are frozen for execution at
+  project creation; the public audit snapshot remains separate.
 - MCP arguments and results retain their declared schemas. Model-correctable
   errors remain tool results; configured incidents pause the whole daemon run.
 

@@ -89,3 +89,35 @@ def test_runpod_facade_freezes_inputs_and_publishes_collected_outputs(tmp_path) 
     result = api.publish_outputs({"state": "succeeded"})
     assert result["workspace_outputs"] == ["gpu-outputs/outputs/metrics.json"]
     assert (workspace / "gpu-outputs" / "outputs" / "metrics.json").read_text() == '{"score":1}'
+
+
+def test_runpod_facade_rejects_symlinked_workspace_ancestors(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    input_root = tmp_path / "inputs"
+    output_root = tmp_path / "outputs"
+    outside = tmp_path / "outside"
+    for path in (workspace, input_root, output_root, outside):
+        path.mkdir()
+    (outside / "secret").write_text("private")
+    (workspace / "link").symlink_to(outside, target_is_directory=True)
+    api = RunpodAPI(
+        str(tmp_path / "unused.sock"),
+        "project",
+        "session",
+        input_root,
+        output_root,
+        workspace,
+        "iteration",
+    )
+
+    with pytest.raises(ValueError, match="escapes its root|contains a symlink"):
+        api.prepare_inputs(["link/secret"])
+
+    collected = output_root / "session" / "sub" / "result.txt"
+    collected.parent.mkdir(parents=True)
+    collected.write_text("remote result")
+    (workspace / "gpu-outputs").mkdir()
+    (workspace / "gpu-outputs" / "sub").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="escapes its root|contains a symlink"):
+        api.publish_outputs({"state": "succeeded"})
+    assert not (outside / "result.txt").exists()

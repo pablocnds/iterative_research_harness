@@ -32,3 +32,20 @@ async def test_upper_has_read_only_project_and_no_network_namespace(config, tmp_
     result = await sandbox.run("cat /project/evidence; ! touch /project/nope", timeout=10)
     assert result["exit_code"] == 0
     assert "yes" in result["output"]
+
+
+@pytest.mark.asyncio
+async def test_command_output_is_streamed_into_a_bounded_tail(config, tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    project = tmp_path / "project"
+    workspace.mkdir()
+    project.mkdir()
+    sandbox = Sandbox("iteration", workspace, tmp_path / "scratch", project, config.sandbox)
+    limit = config.sandbox.command_output_bytes
+    result = await sandbox.run(
+        f"python3 -c \"import sys; sys.stdout.write('x' * {limit * 4} + 'TAIL')\"",
+        timeout=10,
+    )
+    assert result["truncated"] is True
+    assert len(result["output"].encode()) == limit
+    assert result["output"].endswith("TAIL")
