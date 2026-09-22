@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import uuid
@@ -20,6 +21,7 @@ from .types import Role
 from .workspace import reject_symlinks
 
 MAX_TOOL_RESULT_CHARS = 12_000
+CACHE_PREFIX_WARNING_RATIO = 0.8
 
 
 def atomic_json(path: Path, value: object) -> None:
@@ -71,16 +73,57 @@ class AgentSession:
         )
         self.messages: list[dict[str, Any]] = []
         self.usage = {"input_tokens": 0, "output_tokens": 0, "model": config.model.model, "compactions": 0}
+        self.cache_audit: dict[str, Any] = {
+            "last_agent_input_tokens": None,
+            "reset_reason": "new_session",
+            "tool_definitions_sha256": None,
+        }
         if session_path.exists():
             saved = json.loads(session_path.read_text())
+            saved_prompt = saved.get("system_prompt")
+            if isinstance(saved_prompt, str):
+                # A session's system prompt is immutable. Resumes add steering at
+                # the end of the conversation instead of changing its prefix.
+                self.system_prompt = saved_prompt
             self.messages = saved.get("messages", [])
             self.usage.update(saved.get("usage", {}))
+            saved_cache_audit = saved.get("cache_audit")
+            if isinstance(saved_cache_audit, dict):
+                self.cache_audit.update(saved_cache_audit)
+            else:
+                self.cache_audit["reset_reason"] = "legacy_session"
+        else:
+            self.save()
 
     def save(self) -> None:
         atomic_json(
             self.session_path,
-            {"system_prompt": self.system_prompt, "messages": self.messages, "usage": self.usage},
+            {
+                "system_prompt": self.system_prompt,
+                "messages": self.messages,
+                "usage": self.usage,
+                "cache_audit": self.cache_audit,
+            },
         )
+
+    def _extra_body(self) -> dict[str, object]:
+        body = dict(self.config.model.extra_body)
+        body["cache_prompt"] = True
+        return body
+
+    def _record_tool_definitions(self, definitions: list[dict[str, Any]]) -> None:
+        serialized = json.dumps(definitions, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        fingerprint = hashlib.sha256(serialized.encode()).hexdigest()
+        previous = self.cache_audit.get("tool_definitions_sha256")
+        if isinstance(previous, str) and previous != fingerprint:
+            self.cache_audit["reset_reason"] = "tool_definitions_changed"
+            self.store.event(
+                self.project_id,
+                "model_prompt_cache_reset",
+                {"role": self.role, "reason": "tool_definitions_changed"},
+            )
+        self.cache_audit["tool_definitions_sha256"] = fingerprint
+        self.save()
 
     def _close_interrupted_tool_calls(self) -> None:
         """Complete the saved chat protocol without asserting an interrupted tool's outcome."""
@@ -154,6 +197,14 @@ class AgentSession:
     async def _complete(self, request_kind: str, **request: Any) -> Any:
         request_id = uuid.uuid4().hex
         started = asyncio.get_running_loop().time()
+        last_agent_input_tokens = self.cache_audit.get("last_agent_input_tokens")
+        reset_reason = self.cache_audit.get("reset_reason")
+        cache_expected = (
+            request_kind == "agent"
+            and isinstance(last_agent_input_tokens, int)
+            and last_agent_input_tokens > 0
+            and reset_reason is None
+        )
         self.store.event(
             self.project_id,
             "model_request_started",
@@ -203,31 +254,77 @@ class AgentSession:
         response_usage = response.usage
         input_tokens = int(getattr(response_usage, "prompt_tokens", 0) or 0)
         output_tokens = int(getattr(response_usage, "completion_tokens", 0) or 0)
+        prompt_details = getattr(response_usage, "prompt_tokens_details", None)
+        cached_value = (
+            prompt_details.get("cached_tokens")
+            if isinstance(prompt_details, dict)
+            else getattr(prompt_details, "cached_tokens", None)
+        )
+        cached_input_tokens = (
+            cached_value
+            if isinstance(cached_value, int) and not isinstance(cached_value, bool) and cached_value >= 0
+            else None
+        )
+        evaluated_input_tokens = (
+            max(0, input_tokens - cached_input_tokens) if cached_input_tokens is not None else None
+        )
+        cache_ratio = (
+            cached_input_tokens / input_tokens
+            if cached_input_tokens is not None and input_tokens > 0
+            else None
+        )
+        warning_reason = None
+        if cache_expected:
+            if cached_input_tokens is None:
+                warning_reason = "cached_token_usage_unavailable"
+            elif cached_input_tokens == 0:
+                warning_reason = "no_cached_prefix"
+            elif cached_input_tokens < int(last_agent_input_tokens * CACHE_PREFIX_WARNING_RATIO):
+                warning_reason = "cached_prefix_smaller_than_expected"
         self.usage["input_tokens"] += input_tokens
         self.usage["output_tokens"] += output_tokens
+        if request_kind == "agent":
+            self.cache_audit["last_agent_input_tokens"] = input_tokens
+            self.cache_audit["reset_reason"] = None
         self.save()
-        self.store.event(
-            self.project_id,
-            "model_request_finished",
-            {
-                "role": self.role,
-                "request_id": request_id,
-                "request_kind": request_kind,
-                "model": self.config.model.model,
-                "ok": True,
-                "elapsed_seconds": elapsed,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-                "effective_input_tokens_per_second": input_tokens / elapsed if elapsed > 0 else None,
-                "effective_output_tokens_per_second": output_tokens / elapsed if elapsed > 0 else None,
-                "effective_total_tokens_per_second": (input_tokens + output_tokens) / elapsed
-                if elapsed > 0
-                else None,
-                "cumulative_input_tokens": self.usage["input_tokens"],
-                "cumulative_output_tokens": self.usage["output_tokens"],
-            },
-        )
+        finished = {
+            "role": self.role,
+            "request_id": request_id,
+            "request_kind": request_kind,
+            "model": self.config.model.model,
+            "ok": True,
+            "elapsed_seconds": elapsed,
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "evaluated_input_tokens": evaluated_input_tokens,
+            "cache_ratio": cache_ratio,
+            "cache_expected": cache_expected,
+            "cache_reset_reason": reset_reason if request_kind == "agent" and not cache_expected else None,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "effective_input_tokens_per_second": input_tokens / elapsed if elapsed > 0 else None,
+            "effective_output_tokens_per_second": output_tokens / elapsed if elapsed > 0 else None,
+            "effective_total_tokens_per_second": (input_tokens + output_tokens) / elapsed
+            if elapsed > 0
+            else None,
+            "cumulative_input_tokens": self.usage["input_tokens"],
+            "cumulative_output_tokens": self.usage["output_tokens"],
+        }
+        self.store.event(self.project_id, "model_request_finished", finished)
+        if warning_reason is not None:
+            self.store.event(
+                self.project_id,
+                "model_prompt_cache_warning",
+                {
+                    "role": self.role,
+                    "request_id": request_id,
+                    "request_kind": request_kind,
+                    "reason": warning_reason,
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_input_tokens,
+                    "expected_prefix_tokens": last_agent_input_tokens,
+                },
+            )
         return response
 
     def _agent_request(self, definitions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -238,7 +335,7 @@ class AgentSession:
             "tool_choice": "auto",
             "max_tokens": self.config.model.max_output_tokens,
             "temperature": self.config.model.temperature,
-            "extra_body": self.config.model.extra_body or None,
+            "extra_body": self._extra_body(),
         }
 
     async def compact_if_needed(self, definitions: list[dict[str, Any]]) -> None:
@@ -262,7 +359,7 @@ class AgentSession:
                 ],
                 "max_tokens": min(4096, self.config.model.max_output_tokens),
                 "temperature": 0,
-                "extra_body": self.config.model.extra_body or None,
+                "extra_body": self._extra_body(),
             }
             compact_tokens = await self._count_tokens(compact_request)
             if compact_tokens + compact_request["max_tokens"] >= self.config.model.context_window:
@@ -273,6 +370,8 @@ class AgentSession:
             summary = response.choices[0].message.content or "No summary was returned."
             self.messages = [{"role": "user", "content": "Prior-session summary:\n" + summary}, *recent]
             self.usage["compactions"] += 1
+            self.cache_audit["last_agent_input_tokens"] = None
+            self.cache_audit["reset_reason"] = "compaction"
             self.save()
             self.store.event(self.project_id, "session_compacted", {"role": self.role})
         raise InterventionRequired("model", {"error": "History remains above the compaction threshold"})
@@ -323,6 +422,7 @@ class AgentSession:
             self.messages.append({"role": "user", "content": prompt})
             self.save()
         definitions = [tool.openai_definition() for tool in self.tools.values()]
+        self._record_tool_definitions(definitions)
         for _step in range(256):
             if self.abort.is_set():
                 raise asyncio.CancelledError("Agent phase was stopped")

@@ -49,7 +49,8 @@ with `decide`.
 
 Sessions are stored as JSON. Planning and each upper review have separate
 sessions. A timed-out iteration continues in its existing session, preserving
-its working context, but only bounded file listing and read-only file access, `write_paper`,
+its working context and original system prompt, but only bounded file listing
+and read-only file access, `write_paper`,
 `time_remaining`, and `submit_results` remain model-visible. Its configurable
 write-up grace defaults to one hour and is accounted separately from execution
 time; if exhausted without a paper, the project pauses for the operator. Review
@@ -59,9 +60,11 @@ model request, the harness asks the model's
 existing context threshold is unchanged; when reached, the model creates a
 compact continuation summary while retaining recent turns. Tool results are
 included only once, and large ones are saved to the agent's readable files with
-a bounded preview and path in the conversation. Tool calls and per-request model timing/token usage are recorded as
-append-only SQLite events. Project status exposes aggregate token usage without
-exposing the private session transcript. Reported token rates are effective
+a bounded preview and path in the conversation. Tool calls and per-request model
+timing, token usage, and prompt-cache usage are recorded as append-only SQLite
+events. A non-pausing warning event identifies a warm continuation that does not
+substantially reuse the preceding prompt. Project status exposes aggregate token
+usage without exposing the private session transcript. Reported token rates are effective
 tokens per full request second, including provider queueing and prompt handling;
 they are not a claim about raw decoder throughput.
 

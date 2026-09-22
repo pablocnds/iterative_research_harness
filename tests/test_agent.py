@@ -35,6 +35,32 @@ def make_session(config, tmp_path: Path, *, role: str = "iteration") -> tuple[Ag
     return session, store
 
 
+def test_resume_reuses_the_persisted_system_prompt(config, tmp_path) -> None:
+    session, store = make_session(config, tmp_path)
+    session.messages.append({"role": "user", "content": "existing history"})
+    session.save()
+
+    resumed = AgentSession(
+        config,
+        store,
+        session.project_id,
+        "iteration",
+        session.workspace,
+        session.session_path,
+        "replacement prompt",
+        [],
+        asyncio.Event(),
+        lambda: False,
+    )
+
+    assert resumed.system_prompt == "system prompt"
+    assert resumed._agent_request([])["messages"] == [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "existing history"},
+    ]
+    store.close()
+
+
 @pytest.mark.asyncio
 async def test_parent_cancellation_reaps_in_flight_model_request() -> None:
     session = object.__new__(AgentSession)
@@ -59,7 +85,8 @@ async def test_parent_cancellation_reaps_in_flight_model_request() -> None:
 
 @pytest.mark.asyncio
 async def test_model_token_counter_receives_complete_chat_request(config, tmp_path, monkeypatch) -> None:
-    session, store = make_session(config, tmp_path)
+    model = config.model.model_copy(update={"extra_body": {"cache_prompt": False}})
+    session, store = make_session(config.model_copy(update={"model": model}), tmp_path)
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -74,7 +101,7 @@ async def test_model_token_counter_receives_complete_chat_request(config, tmp_pa
     session.messages.append({"role": "user", "content": "hello"})
     tool = {"type": "function", "function": {"name": "example", "parameters": {"type": "object"}}}
     request = session._agent_request([tool])
-    request["extra_body"] = {"custom_option": True}
+    request["extra_body"]["custom_option"] = True
     assert await session._count_tokens(request) == 1234
     assert seen["path"] == "/v1/chat/completions/input_tokens"
     assert seen["body"]["messages"] == [
@@ -82,8 +109,52 @@ async def test_model_token_counter_receives_complete_chat_request(config, tmp_pa
         {"role": "user", "content": "hello"},
     ]
     assert seen["body"]["tools"] == [tool]
+    assert seen["body"]["cache_prompt"] is True
     assert seen["body"]["custom_option"] is True
     assert "extra_body" not in seen["body"]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_cache_usage_is_recorded_and_unexpected_reprocessing_warns(config, tmp_path) -> None:
+    session, store = make_session(config, tmp_path)
+    responses = iter(
+        (
+            SimpleNamespace(
+                usage=SimpleNamespace(
+                    prompt_tokens=100,
+                    completion_tokens=10,
+                    prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+                )
+            ),
+            SimpleNamespace(
+                usage=SimpleNamespace(
+                    prompt_tokens=130,
+                    completion_tokens=5,
+                    prompt_tokens_details=SimpleNamespace(cached_tokens=10),
+                )
+            ),
+        )
+    )
+
+    class Completions:
+        async def create(self, **_request):
+            return next(responses)
+
+    session.client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    await session._complete("agent", model="test-model", messages=[])
+    await session._complete("agent", model="test-model", messages=[])
+
+    events = store.events(session.project_id)
+    finishes = [event for event in events if event["kind"] == "model_request_finished"]
+    assert finishes[0]["data"]["cache_expected"] is False
+    assert finishes[0]["data"]["cache_reset_reason"] == "new_session"
+    assert finishes[1]["data"]["cache_expected"] is True
+    assert finishes[1]["data"]["cached_input_tokens"] == 10
+    assert finishes[1]["data"]["evaluated_input_tokens"] == 120
+    warning = next(event for event in events if event["kind"] == "model_prompt_cache_warning")
+    assert warning["data"]["reason"] == "cached_prefix_smaller_than_expected"
+    assert warning["data"]["expected_prefix_tokens"] == 100
     store.close()
 
 

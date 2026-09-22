@@ -71,8 +71,12 @@ assistant agent, network listener, or independent mutation path.
 Project status includes aggregate model-token usage and current/latest request
 activity. The bounded event feed includes `model_request_started` and
 `model_request_finished` records with request latency and effective token rates,
-so a separate local observer can poll by cursor without reading private session
-files or the SQLite database directly.
+prompt-cache token counts, and the evaluated-token remainder. An expected warm
+continuation that reports no cache usage, unavailable cache usage, or less than
+80% of the preceding prompt prefix also emits `model_prompt_cache_warning`.
+These warnings are observational and do not pause a project. A separate local
+observer can poll by cursor without reading private session files or the SQLite
+database directly.
 
 An iteration submits `paper.md` (Methodology, Results, Conclusions) plus selected
 supplementary files. If execution times out, the same agent session enters a
