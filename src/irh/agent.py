@@ -431,7 +431,7 @@ class AgentSession:
             self.save()
         definitions = [tool.openai_definition() for tool in self.tools.values()]
         self._record_tool_definitions(definitions)
-        for _step in range(256):
+        while True:
             if self.abort.is_set():
                 raise asyncio.CancelledError("Agent phase was stopped")
             await self.compact_if_needed(definitions)
@@ -506,4 +506,3 @@ class AgentSession:
                 self.save()
             if self.terminal():
                 return self.usage
-        raise RuntimeError("Agent exceeded the per-phase tool-turn limit")

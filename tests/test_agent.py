@@ -264,6 +264,46 @@ async def test_iteration_resume_does_not_append_unchanged_definition(config, tmp
     store.close()
 
 
+@pytest.mark.asyncio
+async def test_agent_turns_are_bounded_by_phase_time_not_a_fixed_count(config, tmp_path, monkeypatch) -> None:
+    session, store = make_session(config, tmp_path)
+    calls = 0
+
+    async def continue_until_done(_arguments):
+        nonlocal calls
+        calls += 1
+        return ToolResult(text="done" if calls >= 257 else "continue")
+
+    session.terminal = lambda: calls >= 257
+    session.tools = {
+        "work": AgentTool("work", "Work", {"type": "object", "properties": {}}, continue_until_done)
+    }
+
+    async def count(_request):
+        return 10
+
+    async def complete(**_request):
+        call_id = f"call-{calls + 1}"
+        call = SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(name="work", arguments="{}"),
+            model_dump=lambda mode="json": {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "work", "arguments": "{}"},
+            },
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[call]))]
+        )
+
+    monkeypatch.setattr(session, "_count_tokens", count)
+    monkeypatch.setattr(session, "_complete", complete)
+    await session.run("continue until the phase deadline or completion")
+    assert calls == 257
+    store.close()
+
+
 def test_resume_closes_interrupted_tool_calls_without_guessing_outcome(config, tmp_path) -> None:
     session, store = make_session(config, tmp_path)
     session.messages = [
