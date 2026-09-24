@@ -92,8 +92,34 @@ class AgentSession:
                 self.cache_audit.update(saved_cache_audit)
             else:
                 self.cache_audit["reset_reason"] = "legacy_session"
+            if self._sanitize_saved_tool_arguments():
+                self.save()
         else:
             self.save()
+
+    def _sanitize_saved_tool_arguments(self) -> bool:
+        """Keep model-generated tool calls parseable on later continuations.
+
+        llama.cpp's token-count endpoint parses historical function arguments as
+        JSON. A truncated tool call can therefore prevent an otherwise valid
+        conversation from resuming. The tool result retains the original error.
+        """
+        changed = False
+        for message in self.messages:
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                raw = function.get("arguments") or "{}"
+                try:
+                    json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    function["arguments"] = "{}"
+                    changed = True
+                    self.store.event(
+                        self.project_id,
+                        "malformed_tool_arguments_sanitized",
+                        {"role": self.role, "call_id": call.get("id"), "tool": function.get("name")},
+                    )
+        return changed
 
     def save(self) -> None:
         atomic_json(
@@ -441,9 +467,19 @@ class AgentSession:
             )
             message = response.choices[0].message
             assistant: dict[str, Any] = {"role": "assistant", "content": message.content}
+            malformed_arguments: dict[str, str] = {}
             if message.tool_calls:
                 assistant["tool_calls"] = [call.model_dump(mode="json") for call in message.tool_calls]
-            self.messages.append(assistant)
+                for call in assistant["tool_calls"]:
+                    function = call.get("function") or {}
+                    try:
+                        json.loads(function.get("arguments") or "{}")
+                    except (json.JSONDecodeError, TypeError) as error:
+                        malformed_arguments[call["id"]] = str(error)
+                self.messages.append(assistant)
+                self._sanitize_saved_tool_arguments()
+            else:
+                self.messages.append(assistant)
             self.save()
             if not message.tool_calls:
                 followup = (
@@ -478,6 +514,10 @@ class AgentSession:
                     tool = self.tools.get(name)
                     if tool is None:
                         raise ValueError(f"Unknown tool: {name}")
+                    if call.id in malformed_arguments:
+                        raise ValueError(
+                            f"Tool arguments are not valid JSON: {malformed_arguments[call.id]}"
+                        )
                     try:
                         arguments = json.loads(call.function.arguments or "{}")
                     except json.JSONDecodeError as error:

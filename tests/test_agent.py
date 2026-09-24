@@ -61,6 +61,107 @@ def test_resume_reuses_the_persisted_system_prompt(config, tmp_path) -> None:
     store.close()
 
 
+def test_resume_repairs_malformed_historical_tool_arguments(config, tmp_path) -> None:
+    session, store = make_session(config, tmp_path)
+    session.messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "written",
+                    "type": "function",
+                    "function": {"name": "write_paper", "arguments": '{"content":"paper"}'},
+                },
+                {
+                    "id": "truncated",
+                    "type": "function",
+                    "function": {"name": "write_paper", "arguments": '{"content":"unfinished'},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "written", "content": "paper.md written"},
+        {"role": "tool", "tool_call_id": "truncated", "content": "invalid JSON"},
+    ]
+    session.save()
+
+    resumed = AgentSession(
+        config, store, session.project_id, "iteration", session.workspace,
+        session.session_path, "replacement prompt", [], asyncio.Event(), lambda: False,
+    )
+
+    calls = resumed.messages[0]["tool_calls"]
+    assert calls[0]["function"]["arguments"] == '{"content":"paper"}'
+    assert calls[1]["function"]["arguments"] == "{}"
+    assert resumed.messages[1:] == session.messages[1:]
+    assert json.loads(session.session_path.read_text())["messages"] == resumed.messages
+    assert [e["data"]["call_id"] for e in store.events(session.project_id)
+            if e["kind"] == "malformed_tool_arguments_sanitized"] == ["truncated"]
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_call_is_sanitized_before_next_request(config, tmp_path, monkeypatch) -> None:
+    session, store = make_session(config, tmp_path)
+    seen_requests = []
+    written = []
+    finished = False
+
+    async def write(arguments):
+        written.append(arguments["content"])
+        return ToolResult(text="paper.md written")
+
+    async def finish(_arguments):
+        nonlocal finished
+        finished = True
+        return ToolResult(text="done")
+
+    session.tools = {
+        "write_paper": AgentTool("write_paper", "Write", {"type": "object", "properties": {
+            "content": {"type": "string"}}, "required": ["content"]}, write),
+        "submit_results": AgentTool("submit_results", "Finish", {"type": "object", "properties": {}}, finish),
+    }
+    session.terminal = lambda: finished
+
+    def call(call_id, name, arguments):
+        return SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(name=name, arguments=arguments),
+            model_dump=lambda mode="json": {
+                "id": call_id, "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            },
+        )
+
+    responses = iter([
+        [call("written", "write_paper", '{"content":"paper"}'),
+         call("truncated", "write_paper", '{"content":"unfinished')],
+        [call("submit", "submit_results", "{}")],
+    ])
+
+    async def count(request):
+        seen_requests.append(request["messages"])
+        for message in request["messages"]:
+            for tool_call in message.get("tool_calls") or []:
+                json.loads(tool_call["function"]["arguments"])
+        return 10
+
+    async def complete(**_request):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content=None, tool_calls=next(responses)))])
+
+    monkeypatch.setattr(session, "_count_tokens", count)
+    monkeypatch.setattr(session, "_complete", complete)
+    await session.run("write paper")
+
+    assert written == ["paper"]
+    assert finished
+    assert len(seen_requests) == 2
+    assert session.messages[1]["tool_calls"][1]["function"]["arguments"] == "{}"
+    assert "not valid JSON" in session.messages[3]["content"]
+    store.close()
+
+
 @pytest.mark.asyncio
 async def test_parent_cancellation_reaps_in_flight_model_request() -> None:
     session = object.__new__(AgentSession)
