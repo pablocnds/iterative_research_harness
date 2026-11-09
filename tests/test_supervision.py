@@ -218,7 +218,7 @@ async def test_pause_idempotence_provenance_and_run_resume(config):
     request = store.request_pause(project_id, "supervisor", "Inspect evidence")
     store.pause(project_id, "Inspect evidence")
     manager = ExecutionManager(config, store)
-    repeated = await manager.pause(project_id, "operator", "Repeated request")
+    repeated = await manager.pause(project_id, "supervisor", "Repeated request")
     assert repeated["pause_request"]["id"] == request["id"]
     assert repeated["pause_request"]["actor"] == "supervisor"
     assert store.get_project(project_id)["resume_phase"] == "planning"
@@ -226,6 +226,60 @@ async def test_pause_idempotence_provenance_and_run_resume(config):
         store.start_run(project_id, True, 2, "operator")
     assert store.start_run(project_id, True, None, "operator")["id"] == run["id"]
     store.resume(project_id)
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_paused", [False, True])
+async def test_operator_hold_supersedes_automatic_pause_and_blocks_agent_resume(config, already_paused):
+    store, project_id = project_store(config)
+    run = store.start_run(project_id, False, 1, "supervisor")
+    automatic = store.request_pause(project_id, "supervisor", "Routine inspection")
+    if already_paused:
+        store.pause(project_id, "Routine inspection")
+    manager = ExecutionManager(config, store)
+    hold = await manager.pause(project_id, "operator", "Wait for my instructions")
+    assert hold["pause_request"]["id"] != automatic["id"]
+    assert hold["pause_request"]["actor"] == "operator"
+    assert hold["pause_request"]["reason"] == "Wait for my instructions"
+    assert hold["state"] == "paused"
+    for actor in ("operator", "supervisor", "harness", "daemon"):
+        repeated = await manager.pause(project_id, actor, "Another pause")
+        assert repeated["pause_request"]["id"] == hold["pause_request"]["id"]
+
+    reopened = Store(config.data_root)
+    store.close()
+    manager = ExecutionManager(config, reopened)
+    with pytest.raises(ConflictError, match="held by the operator"):
+        await manager.start(project_id, resume=True, actor="supervisor")
+    assert not manager.tasks
+    assert reopened.latest_run(project_id)["state"] == "paused"
+    assert reopened.get_project(project_id)["phase"] == "paused"
+    assert reopened.start_run(project_id, True, None, "operator")["id"] == run["id"]
+    reopened.resume(project_id)
+    # After operator resume, a fresh automatic pause is no longer a user hold.
+    fresh = reopened.request_pause(project_id, "supervisor", "New routine check")
+    assert fresh["actor"] == "supervisor"
+    reopened.pause(project_id, "New routine check")
+    assert reopened.start_run(project_id, True, None, "supervisor")["id"] == run["id"]
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_operator_hold_without_previous_run_rejects_resume_via_api(config):
+    store, project_id = project_store(config)
+    manager = ExecutionManager(config, store)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(config, store, manager)), base_url="http://test"
+    ) as client:
+        response = await client.post(f"/v1/projects/{project_id}/pause", json={"actor": "operator"})
+        assert response.status_code == 202
+        blocked = await client.post(
+            f"/v1/projects/{project_id}/run", json={"resume": True, "actor": "supervisor"}
+        )
+        assert blocked.status_code == 409
+        assert store.latest_run(project_id) is None
+        assert not manager.tasks
     store.close()
 
 

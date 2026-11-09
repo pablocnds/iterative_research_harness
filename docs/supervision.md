@@ -81,7 +81,17 @@ irh run PROJECT_ID --resume
 
 Omit `--wait-timeout` to wait indefinitely. A client wait timeout exits with an
 error but leaves the request pending. It never cancels the operation. Repeating
-a pause is idempotent and preserves the original request and resume phase.
+a pause is idempotent and preserves the original request and resume phase,
+except that an operator pause supersedes an existing automatic pause to establish
+a user hold. Further automatic pauses cannot replace that hold or its reason.
+
+An operator hold survives daemon restarts. Only an operator-attributed resume
+(`irh run PROJECT_ID --resume --actor operator`; operator is the default) releases
+it; a resume attributed to
+`supervisor` or another non-operator actor returns HTTP 409 without starting work.
+Supervisors must identify themselves with `--actor supervisor` on resume as well
+as on pause. This uses the existing trusted caller-supplied actor convention,
+not a new authentication boundary.
 
 `control.pause_request` records the requester, reason, request time, and
 acknowledgement time. `actor` is caller-supplied attribution under the existing

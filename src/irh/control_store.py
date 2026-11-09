@@ -141,7 +141,13 @@ class ControlStore:
                 ORDER BY requested_at DESC LIMIT 1""",
                 (project_id,),
             ).fetchone()
-            if existing and (not existing["acknowledged_at"] or project["phase"] == "paused"):
+            # An operator can turn an automatic pause into a user hold.
+            # Repeated requests and automatic pauses must not erase that hold.
+            if (
+                existing
+                and (not existing["acknowledged_at"] or project["phase"] == "paused")
+                and (actor != "operator" or existing["actor"] == "operator")
+            ):
                 return dict(existing)
             value = {
                 "id": uuid.uuid4().hex,
@@ -205,6 +211,10 @@ class ControlStore:
             )
 
     def start_run(self, project_id: str, resume: bool, max_iterations: int | None, actor: str) -> dict:
+        if resume and actor != "operator":
+            pause = self.control_status(project_id)["pause_request"]
+            if pause and pause["actor"] == "operator":
+                raise ConflictError("Project is held by the operator; only an operator resume can release it")
         previous = self.latest_run(project_id)
         if resume and previous and previous["state"] == "paused":
             if max_iterations is not None and max_iterations != previous["max_iterations"]:
