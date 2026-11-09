@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .control_store import ControlStore
 from .errors import ConflictError, NotFoundError
 from .types import Decision, IterationDefinition, IterationReport, ProjectCreate
 
@@ -24,7 +25,7 @@ def decode(value: str | None) -> Any:
     return json.loads(value) if value is not None else None
 
 
-class Store:
+class Store(ControlStore):
     """SQLite is the only authoritative state and event store."""
 
     def __init__(self, root: Path):
@@ -93,6 +94,7 @@ class Store:
         if "execution_json" not in {row["name"] for row in self.db.execute("PRAGMA table_info(projects)")}:
             self.db.execute("ALTER TABLE projects ADD COLUMN execution_json TEXT")
         self.db.commit()
+        self._init_controls()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -359,13 +361,13 @@ class Store:
                 {"iteration": number, "attempt": attempt, "status": status, "error": error},
             )
 
-    def apply_decision(
+    def validate_decision(
         self,
         project_id: str,
         decision: Decision,
         default_iteration_seconds: float,
         max_iteration_seconds: float,
-    ) -> int | None:
+    ) -> dict[str, Any]:
         project = self.get_project(project_id)
         if project["phase"] not in ("planning", "review"):
             raise ConflictError(f"Cannot apply a decision during {project['phase']}")
@@ -381,42 +383,91 @@ class Store:
             assert decision.definition is not None
             if decision.definition.parent != project["current_iteration"]:
                 raise ConflictError("A revision must name the current reviewed iteration as its parent")
-        if project["current_iteration"]:
-            with self.transaction() as db:
+        if (
+            decision.definition
+            and (decision.definition.time_limit_seconds or default_iteration_seconds) > max_iteration_seconds
+        ):
+            raise ConflictError("Iteration time limit exceeds configured ceiling")
+        return project
+
+    def apply_decision(
+        self,
+        project_id: str,
+        decision: Decision,
+        default_iteration_seconds: float,
+        max_iteration_seconds: float,
+        *,
+        dispatch: bool = True,
+    ) -> int | None:
+        project = self.validate_decision(
+            project_id, decision, default_iteration_seconds, max_iteration_seconds
+        )
+        with self.transaction() as db:
+            if project["current_iteration"]:
                 db.execute(
                     "UPDATE iterations SET review_json=? WHERE project_id=? AND number=?",
-                    (
-                        json.dumps(decision.model_dump(mode="json"), separators=(",", ":")),
-                        project_id,
-                        project["current_iteration"],
-                    ),
+                    (decision.model_dump_json(), project_id, project["current_iteration"]),
                 )
-                self._event(
-                    db,
-                    project_id,
-                    "upper_decision",
-                    {"iteration": project["current_iteration"], **decision.model_dump(mode="json")},
-                )
-        if decision.action == "stop":
-            with self.transaction() as db:
+            self._event(
+                db,
+                project_id,
+                "upper_decision",
+                {"iteration": project["current_iteration"], **decision.model_dump(mode="json")},
+            )
+            if decision.action == "stop":
                 db.execute(
                     "UPDATE projects SET phase='complete',conclusion=?,resume_phase=NULL WHERE id=?",
                     (decision.reason, project_id),
                 )
+                db.execute("DELETE FROM pending_decisions WHERE project_id=?", (project_id,))
                 self._event(db, project_id, "project_completed", decision.model_dump(mode="json"))
-            return None
-        assert decision.definition is not None
-        return self.define_iteration(
-            project_id,
-            decision.definition,
-            default_iteration_seconds,
-            max_iteration_seconds,
-        )
+            else:
+                db.execute(
+                    "INSERT OR REPLACE INTO pending_decisions VALUES(?,?)",
+                    (project_id, decision.model_dump_json()),
+                )
+                db.execute("UPDATE projects SET phase='ready' WHERE id=?", (project_id,))
+            db.execute("DELETE FROM phase_results WHERE project_id=? AND kind='decision'", (project_id,))
+        if dispatch and decision.action != "stop":
+            return self.dispatch_pending(project_id, default_iteration_seconds, max_iteration_seconds)
+        return None
+
+    def dispatch_pending(self, project_id: str, default_seconds: float, max_seconds: float) -> int:
+        project = self.get_project(project_id)
+        if project["phase"] != "ready":
+            raise ConflictError("Project is not ready to dispatch")
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT decision_json FROM pending_decisions WHERE project_id=?", (project_id,)
+            ).fetchone()
+            if not row:
+                raise ConflictError("Pending decision is missing")
+            decision = Decision.model_validate_json(row[0])
+            definition = decision.definition
+            assert definition is not None
+            seconds = definition.time_limit_seconds or default_seconds
+            if seconds > max_seconds:
+                raise ConflictError("Iteration time limit exceeds configured ceiling")
+            number = project["current_iteration"] + 1
+            payload = definition.model_dump(mode="json")
+            payload["time_limit_seconds"] = seconds
+            db.execute(
+                "INSERT INTO iterations(project_id,number,status,definition_json) VALUES(?,?,'defined',?)",
+                (project_id, number, json.dumps(payload)),
+            )
+            db.execute(
+                "UPDATE projects SET current_iteration=?,phase='executing',resume_phase=NULL,pause_reason=NULL WHERE id=?",
+                (number, project_id),
+            )
+            db.execute("DELETE FROM pending_decisions WHERE project_id=?", (project_id,))
+            self._event(db, project_id, "iteration_defined", {"iteration": number, "definition": payload})
+        return number
 
     def pause(self, project_id: str, reason: str, *, resume_phase: str | None = None) -> None:
         project = self.get_project(project_id)
-        if project["phase"] == "complete":
+        if project["phase"] in ("complete", "paused"):
             return
+        request = self.request_pause(project_id, "harness", reason)
         target = resume_phase or project["phase"]
         with self.transaction() as db:
             db.execute(
@@ -428,7 +479,19 @@ class Store:
                     "UPDATE iterations SET resume_allowed=1 WHERE project_id=? AND number=?",
                     (project_id, project["current_iteration"]),
                 )
-            self._event(db, project_id, "project_paused", {"reason": reason, "resume_phase": target})
+            self._event(
+                db,
+                project_id,
+                "project_paused",
+                {
+                    "reason": reason,
+                    "resume_phase": target,
+                    "actor": request["actor"],
+                    "request_id": request["id"],
+                },
+            )
+        self.acknowledge_pause(project_id)
+        self.end_run(project_id, "paused", reason)
 
     def resume(self, project_id: str) -> None:
         project = self.get_project(project_id)
@@ -456,22 +519,53 @@ class Store:
 
     def register_artifact(self, project_id: str, iteration: int, path: str, sha256: str, size: int) -> None:
         with self.transaction() as db:
-            db.execute(
-                """INSERT OR REPLACE INTO artifacts(project_id,iteration,path,sha256,bytes,created_at)
-                   VALUES(?,?,?,?,?,?)""",
-                (project_id, iteration, path, sha256, size, utcnow()),
+            self._register_artifact(
+                db, project_id, "iteration", str(iteration), iteration, path, sha256, size
             )
-            self._event(
-                db,
-                project_id,
-                "artifact_registered",
-                {"iteration": iteration, "path": path, "sha256": sha256, "bytes": size},
-            )
+
+    def _register_artifact(
+        self,
+        db: sqlite3.Connection,
+        project_id: str,
+        owner_kind: str,
+        owner_id: str,
+        iteration: int | None,
+        path: str,
+        sha256: str,
+        size: int,
+    ) -> None:
+        existing = db.execute(
+            """SELECT sha256,bytes FROM artifacts
+            WHERE project_id=? AND owner_kind=? AND owner_id=? AND path=?""",
+            (project_id, owner_kind, owner_id, path),
+        ).fetchone()
+        if existing:
+            if existing["sha256"] != sha256 or existing["bytes"] != size:
+                raise ConflictError("Registered artifacts are immutable")
+            return
+        db.execute(
+            """INSERT INTO artifacts
+            (project_id,iteration,owner_kind,owner_id,path,sha256,bytes,created_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (project_id, iteration, owner_kind, owner_id, path, sha256, size, utcnow()),
+        )
+        self._event(
+            db,
+            project_id,
+            "artifact_registered",
+            {
+                "iteration": iteration,
+                "owner_kind": owner_kind,
+                "owner_id": owner_id,
+                "path": path,
+                "sha256": sha256,
+                "bytes": size,
+            },
+        )
 
     def artifacts(self, project_id: str) -> list[dict[str, Any]]:
         with self.lock:
             rows = self.db.execute(
-                "SELECT iteration,path,sha256,bytes,created_at FROM artifacts WHERE project_id=? ORDER BY iteration,path",
+                "SELECT iteration,owner_kind,owner_id,path,sha256,bytes,created_at FROM artifacts WHERE project_id=? ORDER BY owner_kind,owner_id,path",
                 (project_id,),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -535,7 +629,7 @@ class Store:
         """Pause work that was active when the daemon disappeared."""
         recovered: list[str] = []
         for project in self.list_projects():
-            if project["phase"] not in ("planning", "review", "executing", "writeup", "finalizing"):
+            if project["phase"] not in ("planning", "review", "executing", "writeup", "finalizing", "ready"):
                 continue
             # A newly created planning project has no running controller yet.
             with self.lock:
@@ -547,12 +641,14 @@ class Store:
                     (project["id"],),
                 ).fetchone()
             latest_started, latest_stopped = row["started"], row["stopped"]
-            if latest_started <= latest_stopped:
+            run = self.latest_run(project["id"])
+            if latest_started <= latest_stopped and (not run or run["state"] != "running"):
                 continue
             resume_phase = project["phase"]
             if resume_phase == "executing" and project["current_iteration"]:
                 iteration = self.get_iteration(project["id"], project["current_iteration"])
-                if iteration["status"] == "running":
+                result = self.phase_result(project["id"], f"iteration-{project['current_iteration']}")
+                if iteration["status"] == "running" and not result:
                     self.begin_writeup(
                         project["id"],
                         project["current_iteration"],

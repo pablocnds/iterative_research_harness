@@ -10,7 +10,7 @@ from typing import Any
 from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from . import __version__
@@ -21,11 +21,12 @@ from .controller import (
     REVIEW_PROMPT,
     UPPER_PROMPT,
     WRITEUP_PROMPT,
-    Supervisor,
+    ExecutionManager,
 )
 from .errors import ConflictError, HarnessError, NotFoundError
+from .publications import PublicationManager
 from .store import Store
-from .types import ProjectCreate, ProjectRun
+from .types import PauseRequest, ProjectCreate, ProjectRun, PublicationCreate, SteeringMessage
 from .workspace import WorkspaceManager
 
 
@@ -138,10 +139,11 @@ def model_usage(store: Store, project_id: str, controller_active: bool) -> dict[
 def create_app(
     config: HarnessConfig,
     store: Store,
-    supervisor: Supervisor,
+    supervisor: ExecutionManager,
     restart_callback: Any = None,
 ) -> Starlette:
     workspaces = WorkspaceManager(store)
+    papers = PublicationManager(store)
 
     async def health(_request: Request) -> JSONResponse:
         active = [key for key, task in supervisor.tasks.items() if not task.done()]
@@ -195,6 +197,7 @@ def create_app(
                 "iterations": store.history(project_id),
                 "artifacts": store.artifacts(project_id),
                 "model_usage": model_usage(store, project_id, task is not None and not task.done()),
+                "control": store.control_status(project_id),
             }
         )
 
@@ -217,11 +220,56 @@ def create_app(
 
     async def run_project(request: Request) -> JSONResponse:
         value = ProjectRun.model_validate(await body(request))
-        result = await supervisor.start(request.path_params["project_id"], value.resume)
+        result = await supervisor.start(
+            request.path_params["project_id"], value.resume, value.max_iterations, value.actor
+        )
         return json_response(result, 202)
 
     async def pause_project(request: Request) -> JSONResponse:
-        return json_response(await supervisor.pause(request.path_params["project_id"]), 202)
+        value = PauseRequest.model_validate(await body(request))
+        return json_response(
+            await supervisor.pause(request.path_params["project_id"], value.actor, value.reason), 202
+        )
+
+    async def messages(request: Request) -> JSONResponse:
+        project_id = request.path_params["project_id"]
+        if request.method == "GET":
+            return json_response(store.messages(project_id))
+        value = SteeringMessage.model_validate(await body(request))
+        return json_response(store.enqueue_message(project_id, value), 201)
+
+    async def publications(request: Request) -> JSONResponse:
+        project_id = request.path_params["project_id"]
+        if request.method == "GET":
+            return json_response(papers.list(project_id))
+        value = PublicationCreate.model_validate(await body(request))
+        return json_response(papers.create(project_id, value), 201)
+
+    async def publication(request: Request) -> JSONResponse:
+        return json_response(
+            papers.get(request.path_params["project_id"], request.path_params["publication_id"])
+        )
+
+    async def publication_file(request: Request) -> FileResponse:
+        return FileResponse(
+            papers.file(
+                request.path_params["project_id"],
+                request.path_params["publication_id"],
+                request.path_params["path"],
+            )
+        )
+
+    async def publication_export(request: Request) -> Response:
+        import io
+        import zipfile
+
+        project_id, publication_id = request.path_params["project_id"], request.path_params["publication_id"]
+        manifest = papers.get(project_id, publication_id)
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in ["manifest.json", *(item["path"] for item in manifest["files"])]:
+                archive.write(papers.file(project_id, publication_id, path), path)
+        return Response(output.getvalue(), media_type="application/zip")
 
     async def events(request: Request) -> JSONResponse:
         after = int(request.query_params.get("after", "0"))
@@ -258,6 +306,19 @@ def create_app(
             Route("/v1/projects/{project_id}/resources", add_resource, methods=["POST"]),
             Route("/v1/projects/{project_id}/run", run_project, methods=["POST"]),
             Route("/v1/projects/{project_id}/pause", pause_project, methods=["POST"]),
+            Route("/v1/projects/{project_id}/messages", messages, methods=["POST", "GET"]),
+            Route("/v1/projects/{project_id}/publications", publications, methods=["POST", "GET"]),
+            Route("/v1/projects/{project_id}/publications/{publication_id}", publication, methods=["GET"]),
+            Route(
+                "/v1/projects/{project_id}/publications/{publication_id}/export",
+                publication_export,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/projects/{project_id}/publications/{publication_id}/files/{path:path}",
+                publication_file,
+                methods=["GET"],
+            ),
             Route("/v1/projects/{project_id}/events", events, methods=["GET"]),
             Route("/v1/projects/{project_id}/artifacts", artifacts, methods=["GET"]),
             Route("/v1/admin/restart", restart, methods=["POST"]),

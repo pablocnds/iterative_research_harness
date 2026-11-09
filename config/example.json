@@ -23,6 +23,7 @@
   "max_iteration_seconds": 86400,
   "writeup_seconds": 3600,
   "upper_seconds": 7200,
+  "reminder_seconds": 1800,
   "tools": [
     {
       "id": "manual",

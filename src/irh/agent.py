@@ -14,7 +14,7 @@ from jsonschema import validate
 from openai import APIError, AsyncOpenAI
 
 from .config import HarnessConfig, read_secret
-from .errors import InterventionRequired
+from .errors import CooperativePause, InterventionRequired
 from .store import Store
 from .tooling import AgentTool
 from .types import Role
@@ -46,6 +46,7 @@ class AgentSession:
         terminal: Callable[[], bool],
         project_view: Path | None = None,
         report_only: bool = False,
+        pause_requested: asyncio.Event | None = None,
     ):
         self.config = config
         self.store = store
@@ -59,6 +60,8 @@ class AgentSession:
         self.terminal = terminal
         self.project_view = project_view or store.project_dir(project_id)
         self.report_only = report_only
+        self.pause_requested = pause_requested or asyncio.Event()
+        self.delivered_message_ids: list[str] = []
         self.api_key = read_secret(config.model.api_key_file)
         self.client = AsyncOpenAI(
             base_url=config.model.base_url.rstrip("/") + "/v1",
@@ -86,6 +89,7 @@ class AgentSession:
                 # the end of the conversation instead of changing its prefix.
                 self.system_prompt = saved_prompt
             self.messages = saved.get("messages", [])
+            self.delivered_message_ids = saved.get("delivered_message_ids", [])
             self.usage.update(saved.get("usage", {}))
             saved_cache_audit = saved.get("cache_audit")
             if isinstance(saved_cache_audit, dict):
@@ -129,6 +133,7 @@ class AgentSession:
                 "messages": self.messages,
                 "usage": self.usage,
                 "cache_audit": self.cache_audit,
+                "delivered_message_ids": self.delivered_message_ids,
             },
         )
 
@@ -199,6 +204,7 @@ class AgentSession:
             await asyncio.gather(work, stopped, return_exceptions=True)
 
     async def _count_tokens(self, request: dict[str, Any]) -> int:
+        self._pause_checkpoint()
         body = {key: value for key, value in request.items() if key != "extra_body"}
         body.update(request.get("extra_body") or {})
         url = self.config.model.base_url.rstrip("/") + "/v1/chat/completions/input_tokens"
@@ -221,6 +227,7 @@ class AgentSession:
             ) from error
 
     async def _complete(self, request_kind: str, **request: Any) -> Any:
+        self._pause_checkpoint()
         request_id = uuid.uuid4().hex
         started = asyncio.get_running_loop().time()
         last_agent_input_tokens = self.cache_audit.get("last_agent_input_tokens")
@@ -448,6 +455,23 @@ class AgentSession:
             separators=(",", ":"),
         )
 
+    def _pause_checkpoint(self) -> None:
+        if getattr(self, "pause_requested", None) and self.pause_requested.is_set():
+            raise CooperativePause
+
+    def deliver_messages(self) -> None:
+        for value in self.store.messages(self.project_id, self.role):
+            if value["id"] not in self.delivered_message_ids:
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": f"[{value['kind']} from {value['actor']}; message {value['id']}]\n{value['text']}",
+                    }
+                )
+                self.delivered_message_ids.append(value["id"])
+                self.save()
+            self.store.acknowledge_message(self.project_id, value["id"], self.session_path.stem)
+
     async def run(self, prompt: str) -> dict[str, Any]:
         self._close_interrupted_tool_calls()
         if not any(
@@ -460,7 +484,10 @@ class AgentSession:
         while True:
             if self.abort.is_set():
                 raise asyncio.CancelledError("Agent phase was stopped")
+            self._pause_checkpoint()
+            self.deliver_messages()
             await self.compact_if_needed(definitions)
+            self._pause_checkpoint()
             response = await self._complete(
                 request_kind="agent",
                 **self._agent_request(definitions),
@@ -495,6 +522,21 @@ class AgentSession:
                 self.save()
                 continue
             for call in message.tool_calls:
+                if self.pause_requested.is_set() and not self.terminal():
+                    self.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": json.dumps(
+                                {
+                                    "is_error": True,
+                                    "error": "Not executed: cooperative pause requested; no side effects occurred.",
+                                }
+                            ),
+                        }
+                    )
+                    self.save()
+                    continue
                 name = call.function.name
                 started = asyncio.get_running_loop().time()
                 ok = False
@@ -515,9 +557,7 @@ class AgentSession:
                     if tool is None:
                         raise ValueError(f"Unknown tool: {name}")
                     if call.id in malformed_arguments:
-                        raise ValueError(
-                            f"Tool arguments are not valid JSON: {malformed_arguments[call.id]}"
-                        )
+                        raise ValueError(f"Tool arguments are not valid JSON: {malformed_arguments[call.id]}")
                     try:
                         arguments = json.loads(call.function.arguments or "{}")
                     except json.JSONDecodeError as error:
@@ -546,3 +586,4 @@ class AgentSession:
                 self.save()
             if self.terminal():
                 return self.usage
+            self._pause_checkpoint()

@@ -6,7 +6,8 @@
 API on a Unix socket, runs at most one research project at a time, and owns the
 planning → execution → paper review loop. CLI commands never open SQLite directly.
 
-SQLite stores current projects and iterations, explicit attempt records,
+SQLite stores current projects and iterations, explicit attempt and execution
+records, a durable message inbox, pause provenance, accepted phase results,
 artifacts, notes, and an append-only event stream. Event reads are bounded by a
 cursor and limit. Active-time accounting is checkpointed every 30 seconds and
 again at phase exit; no full ledger projection is rewritten on that path. The
@@ -53,6 +54,27 @@ supplementary files; the paper is the substantive report. The upper agent
 reviews that package, plans the next iteration, or requests a targeted revision
 with `decide`.
 
+Review commits its conclusion and proposed next action before dispatching
+another iteration. The `ready` phase holds that proposal. A bounded execution
+ends there after its allowed iteration cycles have been reviewed, leaving the
+project available for another supervisor-authorized run. Revisions count as
+new iterations. Pauses and resumes preserve the execution ID and its allowance.
+
+Steering and periodic time reminders enter a shared durable inbox. The agent
+appends them at complete conversation boundaries before token counting. Receipt
+IDs stored outside compacted conversation history reconcile delivery after a
+crash between the session save and SQLite acknowledgement. Cooperative pause
+uses its own signal: finish and save the current operation, explicitly close
+unstarted batch calls, commit an accepted terminal result, and acknowledge the
+pause before further execution. Cancellation remains a separate interruption
+path for hard deadlines and failures.
+
+Synthesis papers are immutable publication artifacts stored in `syntheses/`,
+independent of iteration ownership. They reuse the artifact registry and file
+hashing/staging machinery. The supervisor supplies their content and source
+references and owns research-line organization. Existing `publications/`
+directories remain the restricted per-iteration review view.
+
 Sessions are stored as JSON. Planning and each upper review have separate
 sessions. A timed-out iteration continues in its existing session, preserving
 its working context and original system prompt, but only bounded file listing
@@ -76,8 +98,10 @@ usage without exposing the private session transcript. Reported token rates are 
 tokens per full request second, including provider queueing and prompt handling;
 they are not a claim about raw decoder throughput.
 
-An unclean daemon loss moves an executing attempt to the same paper-only write-up
-path and pauses for explicit operator resume. Accepted papers first enter a
+An unclean daemon loss moves an executing attempt without an accepted submission
+to the same paper-only write-up path and pauses for explicit operator resume.
+Accepted submissions are journaled before returning their terminal tool result,
+so recovery can finalize them without another model call. Accepted papers enter a
 durable internal finalization phase; archiving, publication, and artifact
 registration are idempotently completed after a restart. A controlled pause
 preserves the active workspace and session. Phase timeout or cancellation also

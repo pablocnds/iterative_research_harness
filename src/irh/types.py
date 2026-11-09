@@ -79,6 +79,38 @@ class ProjectRun(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     resume: bool = Field(default=False, strict=True)
+    max_iterations: int | None = Field(default=None, gt=0, strict=True)
+    actor: str = Field(default="operator", min_length=1, max_length=200)
+
+
+class SteeringMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=32_000)
+    actor: str = Field(default="operator", min_length=1, max_length=200)
+    target: Literal["next", "upper", "iteration"] = "next"
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class PauseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    actor: str = Field(default="operator", min_length=1, max_length=200)
+    reason: str = Field(default="Pause requested", min_length=1, max_length=2000)
+
+
+class PublicationSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    project_id: str
+    iteration: int = Field(gt=0, strict=True)
+
+
+class PublicationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=500)
+    paper: str = Field(min_length=1, max_length=4 * 1024 * 1024)
+    actor: str = Field(default="supervisor", min_length=1, max_length=200)
+    sources: list[PublicationSource] = Field(min_length=1, max_length=256)
+    supplements: dict[str, str] = Field(default_factory=dict, max_length=64)
+    supersedes: str | None = None
 
 
 class ToolResult(BaseModel):

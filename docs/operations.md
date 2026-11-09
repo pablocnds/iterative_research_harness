@@ -49,6 +49,10 @@ administrator to restart or repair the system unit.
 
 ## CLI and API
 
+The [supervisor operating guide](supervision.md) covers steering, cooperative
+pause and waiting, iteration limits, reminder configuration, and publication
+submission/export, including their HTTP API operations.
+
 The CLI defaults to the group-protected Unix socket:
 
 ```sh
@@ -60,7 +64,7 @@ irh run PROJECT_ID
 irh status PROJECT_ID
 irh events PROJECT_ID --after 0 --limit 200
 irh artifacts PROJECT_ID
-irh pause PROJECT_ID
+irh pause PROJECT_ID --actor operator --wait
 irh run PROJECT_ID --resume
 ```
 

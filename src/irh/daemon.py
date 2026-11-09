@@ -11,7 +11,7 @@ import uvicorn
 
 from .api import create_app
 from .config import load_config
-from .controller import Supervisor
+from .controller import ExecutionManager
 from .store import Store
 from .workspace import WorkspaceManager
 
@@ -40,7 +40,7 @@ async def serve(config_path: str | None) -> None:
                 "interrupted_workspace_archived",
                 {"iteration": project["current_iteration"], "path": str(archive)},
             )
-    supervisor = Supervisor(config, store)
+    supervisor = ExecutionManager(config, store)
     restart_requested = False
     server: uvicorn.Server | None = None
 

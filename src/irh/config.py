@@ -96,6 +96,7 @@ class HarnessConfig(BaseModel):
     max_iteration_seconds: int = Field(default=86_400, gt=0)
     writeup_seconds: int = Field(default=3_600, gt=0)
     upper_seconds: int = Field(default=7_200, gt=0)
+    reminder_seconds: float = Field(default=1_800, ge=0)
 
     @model_validator(mode="after")
     def validate_config(self) -> HarnessConfig:

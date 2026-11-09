@@ -10,7 +10,7 @@ from typing import Any
 
 from .agent import AgentSession, atomic_json
 from .config import ExternalToolConfig, HarnessConfig
-from .errors import ConflictError, InterventionRequired
+from .errors import ConflictError, CooperativePause, InterventionRequired
 from .internal_tools import phase_tools
 from .sandbox import Sandbox
 from .store import Store
@@ -93,12 +93,24 @@ class Controller:
         self.store = store
         self.project_id = project_id
         self.abort = asyncio.Event()
+        self.pause_requested = asyncio.Event()
         self.workspaces = WorkspaceManager(store)
         self._operator_pause = False
 
     def stop(self) -> None:
         self._operator_pause = True
-        self.abort.set()
+        self.pause_requested.set()
+
+    async def _reminder_loop(self, done: asyncio.Event) -> None:
+        last = time.monotonic()
+        while not done.is_set():
+            try:
+                await asyncio.wait_for(done.wait(), timeout=min(30, self.config.reminder_seconds or 30))
+            except TimeoutError:
+                pass
+            current = time.monotonic()
+            self.store.tick_run(self.project_id, current - last, self.config.reminder_seconds)
+            last = current
 
     def _tool_configs(self) -> list[Any]:
         execution = self.store.execution_snapshot(self.project_id)
@@ -165,6 +177,12 @@ class Controller:
         mode: str = "normal",
         project_view: Path | None = None,
     ) -> dict[str, Any]:
+        saved_result = self.store.phase_result(self.project_id, session_path.stem)
+        if saved_result:
+            holder = choose if saved_result["kind"] == "decision" else submit
+            model = Decision if saved_result["kind"] == "decision" else IterationReport
+            holder.value = model.model_validate(saved_result["value"])
+            return {}
         budget = ActiveTimeBudget(seconds)
         sandbox = Sandbox(
             role,
@@ -201,11 +219,23 @@ class Controller:
                 prompt_with_guidance = system_prompt
                 if mode == "normal" and hub.guidance:
                     prompt_with_guidance += "\n\nEnabled external-tool guidance:\n" + hub.guidance
+
+                def commit(holder: Any, kind: str, value: Any) -> None:
+                    if kind == "decision":
+                        self.store.validate_decision(
+                            self.project_id,
+                            value,
+                            self.config.iteration_seconds,
+                            self.config.max_iteration_seconds,
+                        )
+                    self.store.save_phase_result(self.project_id, session_path.stem, kind, value)
+                    holder.value = value
+
                 choose_callback = (
-                    (lambda value: setattr(choose, "value", value)) if choose is not None else None
+                    (lambda value: commit(choose, "decision", value)) if choose is not None else None
                 )
                 submit_callback = (
-                    (lambda value: setattr(submit, "value", value)) if submit is not None else None
+                    (lambda value: commit(submit, "submission", value)) if submit is not None else None
                 )
                 internal = phase_tools(
                     role,
@@ -235,6 +265,7 @@ class Controller:
                     terminal,
                     project_view=sandbox.project,
                     report_only=mode == "writeup",
+                    pause_requested=self.pause_requested,
                 )
                 session_task = asyncio.create_task(session.run(prompt))
                 expiry_task = asyncio.create_task(budget.wait_until_exhausted())
@@ -254,6 +285,9 @@ class Controller:
                         raise hub.incident
                     raise
                 finally:
+                    if not session_task.done():
+                        session_task.cancel()
+                    await asyncio.gather(session_task, return_exceptions=True)
                     expiry_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await expiry_task
@@ -265,19 +299,38 @@ class Controller:
             await charge
             self.store.event(self.project_id, "agent_stopped", {"role": role})
 
-    async def run(self, resume: bool = False) -> None:
+    async def run(
+        self, resume: bool = False, max_iterations: int | None = None, actor: str = "operator"
+    ) -> None:
         project = self.store.get_project(self.project_id)
         if project["phase"] == "complete":
             raise ConflictError("Project is complete")
+        if project["phase"] == "paused" and not resume:
+            raise ConflictError("Project is paused; explicitly resume it")
+        if project["phase"] != "paused" and resume:
+            raise ConflictError("Project is not paused; omit --resume")
+        run = self.store.latest_run(self.project_id)
+        if not run or run["state"] != "running":
+            self.store.start_run(self.project_id, resume, max_iterations, actor)
         if project["phase"] == "paused":
-            if not resume:
-                raise ConflictError("Project is paused; explicitly resume it")
             self.store.resume(self.project_id)
         self.store.event(self.project_id, "controller_started", {"resume": resume})
+        reminder_done = asyncio.Event()
+        reminder_task = asyncio.create_task(self._reminder_loop(reminder_done))
         try:
             while not self.abort.is_set():
                 project = self.store.get_project(self.project_id)
                 if project["phase"] in ("complete", "paused"):
+                    break
+                if self.pause_requested.is_set():
+                    raise CooperativePause
+                run = self.store.latest_run(self.project_id)
+                if (
+                    project["phase"] == "ready"
+                    and run["max_iterations"] is not None
+                    and run["iterations_completed"] >= run["max_iterations"]
+                ):
+                    self.store.end_run(self.project_id, "completed", "iteration_limit_reached")
                     break
                 if project["phase"] == "executing":
                     await self._iterate()
@@ -285,8 +338,27 @@ class Controller:
                     await self._writeup()
                 elif project["phase"] == "finalizing":
                     self._finalize(project["current_iteration"])
+                elif project["phase"] == "ready":
+                    # Give queued supervisor guidance a chance to revise the proposal.
+                    if any(m["kind"] == "steering" for m in self.store.messages(self.project_id, "upper")):
+                        with self.store.transaction() as db:
+                            db.execute(
+                                "UPDATE projects SET phase=? WHERE id=?",
+                                ("review" if project["current_iteration"] else "planning", self.project_id),
+                            )
+                        self.store.clear_phase_result(
+                            self.project_id, f"upper-review-{project['current_iteration']}"
+                        )
+                        await self._upper()
+                    else:
+                        self.store.dispatch_pending(
+                            self.project_id, self.config.iteration_seconds, self.config.max_iteration_seconds
+                        )
                 else:
                     await self._upper()
+        except CooperativePause:
+            request = self.store.control_status(self.project_id)["pause_request"]
+            self.store.pause(self.project_id, request["reason"] if request else "Cooperative pause")
         except InterventionRequired as error:
             self.store.event(
                 self.project_id,
@@ -307,6 +379,14 @@ class Controller:
             self.store.pause(self.project_id, f"Controller error: {error}", resume_phase=current["phase"])
             raise
         finally:
+            reminder_done.set()
+            await reminder_task
+            current = self.store.get_project(self.project_id)
+            if current["phase"] == "complete":
+                self.store.acknowledge_pause(self.project_id)
+                self.store.end_run(self.project_id, "completed", "project_complete")
+            elif self.abort.is_set() and current["phase"] != "paused":
+                self.store.pause(self.project_id, "Execution aborted")
             self.store.event(self.project_id, "controller_stopped", {})
 
     async def _upper(self) -> None:
@@ -450,12 +530,18 @@ class Controller:
             choice.value,
             self.config.iteration_seconds,
             self.config.max_iteration_seconds,
+            dispatch=False,
         )
 
     async def _iterate(self) -> None:
         project = self.store.get_project(self.project_id)
         number = project["current_iteration"]
         iteration = self.store.get_iteration(self.project_id, number)
+        accepted = self.store.phase_result(self.project_id, f"iteration-{number}")
+        if accepted:
+            report = IterationReport.model_validate(accepted["value"])
+            self._finish_with_paper(number, report, report.outcome, None)
+            return
         if iteration["status"] == "defined":
             definition = iteration["definition"]
             selections = [InputSelection.model_validate(value) for value in definition.get("inputs", [])]
@@ -524,6 +610,7 @@ class Controller:
             report,
             iteration["error"],
         )
+        self.store.clear_phase_result(self.project_id, f"iteration-{number}")
 
     async def _writeup(self) -> None:
         project = self.store.get_project(self.project_id)
@@ -534,6 +621,13 @@ class Controller:
         workspace = self.store.runtime_dir(self.project_id) / "iteration" / "workspace"
         if not workspace.is_dir():
             raise ConflictError("Write-up workspace is missing")
+        accepted = self.store.phase_result(self.project_id, f"iteration-{number}")
+        if accepted:
+            report = IterationReport.model_validate(accepted["value"])
+            reason = iteration["error"]
+            status = "interrupted" if reason and "daemon stopped" in reason else "timeout"
+            self._finish_with_paper(number, report, status, reason)
+            return
         seconds = self.config.writeup_seconds - iteration["writeup_seconds"]
         if seconds <= 0:
             self.store.pause(self.project_id, "Write-up grace exhausted", resume_phase="writeup")
@@ -568,7 +662,7 @@ class Controller:
         self._finish_with_paper(number, submission.value, status, reason)
 
 
-class Supervisor:
+class ExecutionManager:
     """Own active controllers; all mutating run control passes through this object."""
 
     def __init__(self, config: HarnessConfig, store: Store):
@@ -578,7 +672,13 @@ class Supervisor:
         self.controllers: dict[str, Controller] = {}
         self.lock = asyncio.Lock()
 
-    async def start(self, project_id: str, resume: bool = False) -> dict[str, Any]:
+    async def start(
+        self,
+        project_id: str,
+        resume: bool = False,
+        max_iterations: int | None = None,
+        actor: str = "operator",
+    ) -> dict[str, Any]:
         async with self.lock:
             active = [key for key, task in self.tasks.items() if not task.done()]
             if active:
@@ -591,15 +691,16 @@ class Supervisor:
             if project["phase"] != "paused" and resume:
                 raise ConflictError("Project is not paused; omit --resume")
             controller = Controller(self.config, self.store, project_id)
+            run = self.store.start_run(project_id, resume, max_iterations, actor)
             task = asyncio.create_task(controller.run(resume), name=f"irh:{project_id}")
             self.controllers[project_id] = controller
             self.tasks[project_id] = task
             task.add_done_callback(lambda finished, key=project_id: self._finished(key, finished))
-            return {"accepted": True, "project_id": project_id}
+            return {"accepted": True, "project_id": project_id, "run_id": run["id"]}
 
     def _finished(self, project_id: str, task: asyncio.Task[None]) -> None:
-        self.controllers.pop(project_id, None)
         if self.tasks.get(project_id) is task:
+            self.controllers.pop(project_id, None)
             self.tasks.pop(project_id, None)
         if not task.cancelled():
             error = task.exception()
@@ -610,23 +711,28 @@ class Supervisor:
                     exc_info=(type(error), error, error.__traceback__),
                 )
 
-    async def pause(self, project_id: str) -> dict[str, Any]:
-        controller = self.controllers.get(project_id)
-        task = self.tasks.get(project_id)
-        if controller is None or task is None or task.done():
-            project = self.store.get_project(project_id)
-            self.store.pause(project_id, "Operator requested pause", resume_phase=project["phase"])
-            return {"accepted": True, "state": "paused"}
-        controller.stop()
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=30)
-        except TimeoutError:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        return {"accepted": True, "state": "paused"}
+    async def pause(
+        self, project_id: str, actor: str = "operator", reason: str = "Pause requested"
+    ) -> dict[str, Any]:
+        async with self.lock:
+            request = self.store.request_pause(project_id, actor, reason)
+            controller = self.controllers.get(project_id)
+            task = self.tasks.get(project_id)
+            if controller is None or task is None or task.done():
+                self.store.pause(project_id, reason)
+                self.store.acknowledge_pause(project_id)
+            else:
+                controller.stop()
+            return {"accepted": True, "request_id": request["id"], **self.store.control_status(project_id)}
 
     async def close(self) -> None:
         for controller in list(self.controllers.values()):
-            controller.stop()
+            if self.store.get_project(controller.project_id)["phase"] != "complete":
+                self.store.request_pause(controller.project_id, "daemon", "Daemon shutdown")
+                controller.stop()
         if self.tasks:
             await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+
+
+# Compatibility for integrations importing the old local task-manager name.
+Supervisor = ExecutionManager

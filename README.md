@@ -30,6 +30,9 @@ generic tool-dispatch wrapper, GUI, or observer agent.
 See [architecture](docs/architecture.md), [tool integration](docs/tools.md), and
 [operations](docs/operations.md).
 
+For steering messages, cooperative pause, bounded executions, automatic time
+reminders, and archived synthesis papers, see the [supervisor operating guide](docs/supervision.md).
+
 ## Development
 
 ```sh

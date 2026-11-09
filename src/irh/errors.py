@@ -17,3 +17,7 @@ class InterventionRequired(HarnessError):
         super().__init__(f"{source} requires operator intervention")
         self.source = source
         self.detail = detail
+
+
+class CooperativePause(Exception):
+    """The current operation is saved; no new work should start."""
