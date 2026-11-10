@@ -120,6 +120,8 @@ class Sandbox:
                 "/bin/bash",
                 "--noprofile",
                 "--norc",
+                "-o",
+                "pipefail",
                 "-c",
                 command,
             ]

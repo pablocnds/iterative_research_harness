@@ -62,7 +62,8 @@ def phase_tools(
         else:
             timeout = min(float(timeout), seconds_left)
         value = await sandbox.run(arguments["command"], timeout=timeout)
-        return ToolResult(text=json.dumps(value, separators=(",", ":")), structured=value)
+        return ToolResult(text=json.dumps(value, separators=(",", ":")), structured=value,
+                          is_error=value["exit_code"] != 0)
 
     async def time_remaining(_arguments: dict[str, Any]) -> ToolResult:
         value = {"seconds": remaining()}

@@ -285,6 +285,7 @@ def test_tool_result_is_single_copy_and_large_result_is_inspectable(config, tmp_
 async def test_compaction_uses_existing_96k_threshold_with_exact_count(config, tmp_path, monkeypatch) -> None:
     model = config.model.model_copy(update={"context_window": 131_072, "max_output_tokens": 16_384})
     configured = config.model_copy(update={"model": model})
+    configured.model.extra_body = {"chat_template_kwargs": {"preserve_thinking": False}}
     session, store = make_session(configured, tmp_path)
     session.messages = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "recent"}]
     counts = iter((98_303, 98_304, 1000, 1000))
@@ -305,6 +306,10 @@ async def test_compaction_uses_existing_96k_threshold_with_exact_count(config, t
     assert session.usage["compactions"] == 1
     assert session.messages[0]["content"] == "Prior-session summary:\nsummary"
     assert requests[0]["messages"][0]["content"] == "system prompt"
+    assert requests[2]["messages"][:-1] == requests[1]["messages"]
+    assert requests[2]["tools"] == requests[1]["tools"]
+    assert requests[2]["tool_choice"] == "none"
+    assert requests[2]["extra_body"]["chat_template_kwargs"]["preserve_thinking"] is False
     store.close()
 
 

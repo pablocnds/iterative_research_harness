@@ -233,7 +233,7 @@ class AgentSession:
         last_agent_input_tokens = self.cache_audit.get("last_agent_input_tokens")
         reset_reason = self.cache_audit.get("reset_reason")
         cache_expected = (
-            request_kind == "agent"
+            request_kind in ("agent", "compaction")
             and isinstance(last_agent_input_tokens, int)
             and last_agent_input_tokens > 0
             and reset_reason is None
@@ -345,6 +345,7 @@ class AgentSession:
             "finish_reason": getattr(response.choices[0], "finish_reason", None),
             "answer_characters": len(response.choices[0].message.content or ""),
             "reasoning_characters": len(getattr(response.choices[0].message, "reasoning_content", None) or ""),
+            "timings": getattr(response, "timings", None),
         }
         self.store.event(self.project_id, "model_request_finished", finished)
         if request_kind == "agent" and finished["finish_reason"] == "length":
@@ -395,19 +396,31 @@ class AgentSession:
             if len(self.messages) < 2:
                 raise InterventionRequired("model", {"error": "Prompt is too large to compact"})
             cut = self._compaction_cut()
-            older, recent = self.messages[:cut], self.messages[cut:]
+            recent = self.messages[cut:]
+            parent = self._agent_request(definitions)
+            extra = {**self._extra_body(), **self.config.model.compaction.extra_body, "cache_prompt": True}
+            if "chat_template_kwargs" in self.config.model.compaction.extra_body:
+                extra["chat_template_kwargs"] = {
+                    **self.config.model.extra_body.get("chat_template_kwargs", {}),
+                    **self.config.model.compaction.extra_body["chat_template_kwargs"],
+                }
             compact_request = {
-                "model": self.config.model.model,
+                **parent,
                 "messages": [
+                    *parent["messages"],
                     {
-                        "role": "system",
-                        "content": "Summarize this agent history for exact continuation. Preserve decisions, evidence paths, measurements, failures, open work, and tool state. Do not invent facts.",
+                        "role": "user",
+                        "content": "Context checkpoint: summarize this history for exact continuation. "
+                        "Preserve decisions, evidence paths, measurements, failures, uncertainty, open work, "
+                        "and tool state. Do not invent facts. Return only the continuation summary, "
+                        "without tools or further task work. Recent messages will also be kept verbatim; "
+                        "prioritize earlier decisions and evidence.",
                     },
-                    {"role": "user", "content": json.dumps(older, ensure_ascii=False)},
                 ],
+                "tool_choice": "none",
                 "max_tokens": self.config.model.compaction.max_output_tokens,
                 "temperature": self.config.model.compaction.temperature,
-                "extra_body": {**self._extra_body(), **self.config.model.compaction.extra_body, "cache_prompt": True},
+                "extra_body": extra,
             }
             compact_tokens = await self._count_tokens(compact_request)
             if compact_tokens + compact_request["max_tokens"] >= self.config.model.context_window:

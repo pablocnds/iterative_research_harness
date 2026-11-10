@@ -303,3 +303,16 @@ than retrying automatically. Model events include finish reason and answer/
 reasoning lengths; successful compaction events identify the history archive.
 Validation claims must name the tested build and inputs and retain material
 limitations; a PASS for an older build does not validate current results.
+
+Compaction now keeps the parent system prompt, tool definitions and full history
+in the summary request, appending a user checkpoint instruction with tool calls
+disabled. Thus the summarization step can reuse its cached prefix; the validated
+history replacement is still an intentional reset. Non-thinking summary settings
+merge with existing template options instead of discarding unrelated options.
+
+Raw provider timings accompany model events when supplied. Effective throughput
+includes prefill/request overhead and must not be confused with generation-only
+speed. Status reuses usage metadata for unchanged session files and invalidates
+that cache on file replacement or modification. Shell pipelines propagate
+upstream failures (`pipefail`, without `errexit`); nonzero command results are
+reported as tool errors with their output retained.

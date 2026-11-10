@@ -11,6 +11,31 @@ from irh.store import Store
 from irh.types import ProjectCreate
 
 
+def test_model_usage_reuses_unchanged_sessions_and_refreshes_atomic_replacements(config, monkeypatch):
+    from irh.agent import atomic_json
+
+    store = Store(config.data_root)
+    project = store.create_project(ProjectCreate(name="metrics", goal="observe"), {}, 600)
+    path = store.private_dir(project["id"]) / "sessions/iteration-1.json"
+    atomic_json(path, {"usage": {"input_tokens": 1, "output_tokens": 2}})
+    original = Path.read_text
+    reads = []
+
+    def read(file, *args, **kwargs):
+        if file == path:
+            reads.append(file)
+        return original(file, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    assert model_usage(store, project["id"], False)["totals"]["input_tokens"] == 1
+    assert model_usage(store, project["id"], False)["totals"]["input_tokens"] == 1
+    assert len(reads) == 1
+    atomic_json(path, {"usage": {"input_tokens": 3, "output_tokens": 2}})
+    assert model_usage(store, project["id"], False)["totals"]["input_tokens"] == 3
+    assert len(reads) == 2
+    store.close()
+
+
 def test_skill_source_symlink_is_rejected(tmp_path: Path) -> None:
     skill = tmp_path / "skill.md"
     skill.write_text("instructions")

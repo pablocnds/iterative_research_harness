@@ -27,6 +27,16 @@ async def test_shell_children_end_with_the_call_and_tmp_is_fresh(config, tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_shell_pipeline_reports_upstream_failure(config, tmp_path):
+    workspace, project = tmp_path / "workspace", tmp_path / "project"
+    workspace.mkdir()
+    project.mkdir()
+    sandbox = Sandbox("iteration", workspace, tmp_path / "scratch", project, config.sandbox)
+    result = await sandbox.run("(exit 2) | cat", timeout=5)
+    assert result["exit_code"] == 2
+
+
+@pytest.mark.asyncio
 async def test_iteration_sandbox_can_write_workspace_but_not_host(config, tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     scratch = tmp_path / "scratch"

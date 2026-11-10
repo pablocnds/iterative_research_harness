@@ -96,6 +96,9 @@ def model_usage(store: Store, project_id: str, controller_active: bool) -> dict[
     sessions: list[dict[str, Any]] = []
     seen_sessions: set[str] = set()
     directory = store.private_dir(project_id) / "sessions"
+    cache = getattr(store, "_model_usage_cache", None)
+    if cache is None:
+        cache = store._model_usage_cache = {}
     for path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
         session_name = "upper" if path.name == "upper.json.json" else path.stem
         iteration_match = re.fullmatch(r"iteration-(\d+)", session_name)
@@ -105,7 +108,14 @@ def model_usage(store: Store, project_id: str, controller_active: bool) -> dict[
         if session_name in seen_sessions:
             continue
         try:
-            usage = json.loads(path.read_text()).get("usage", {})
+            stat = path.stat()
+            fingerprint = (stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+            cached = cache.get(path)
+            if cached and cached[0] == fingerprint:
+                usage = cached[1]
+            else:
+                usage = json.loads(path.read_text()).get("usage", {})
+                cache[path] = (fingerprint, usage)
         except (OSError, json.JSONDecodeError):
             continue
         seen_sessions.add(session_name)
