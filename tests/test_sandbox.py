@@ -1,10 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from irh.sandbox import Sandbox
+
+
+@pytest.mark.asyncio
+async def test_shell_children_end_with_the_call_and_tmp_is_fresh(config, tmp_path):
+    workspace, project = tmp_path / "workspace", tmp_path / "project"
+    workspace.mkdir()
+    project.mkdir()
+    sandbox = Sandbox("iteration", workspace, tmp_path / "scratch", project, config.sandbox)
+    result = await sandbox.run(
+        "touch /tmp/per-call; echo persistent > /workspace/kept; "
+        "setsid nohup sh -c 'sleep 1; echo survived > /workspace/escaped' >/dev/null 2>&1 < /dev/null & "
+        "disown; sleep 0.1", timeout=5,
+    )
+    assert result["exit_code"] == 0
+    await asyncio.sleep(1.2)
+    assert not (workspace / "escaped").exists()
+    result = await sandbox.run("test ! -e /tmp/per-call && test -s /workspace/kept", timeout=5)
+    assert result["exit_code"] == 0
 
 
 @pytest.mark.asyncio

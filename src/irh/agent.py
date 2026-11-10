@@ -342,8 +342,15 @@ class AgentSession:
             else None,
             "cumulative_input_tokens": self.usage["input_tokens"],
             "cumulative_output_tokens": self.usage["output_tokens"],
+            "finish_reason": getattr(response.choices[0], "finish_reason", None),
+            "answer_characters": len(response.choices[0].message.content or ""),
+            "reasoning_characters": len(getattr(response.choices[0].message, "reasoning_content", None) or ""),
         }
         self.store.event(self.project_id, "model_request_finished", finished)
+        if request_kind == "agent" and finished["finish_reason"] == "length":
+            self.store.event(self.project_id, "model_output_truncated", {
+                "role": self.role, "request_id": request_id, "output_tokens": output_tokens,
+            })
         if warning_reason is not None:
             self.store.event(
                 self.project_id,
@@ -398,23 +405,38 @@ class AgentSession:
                     },
                     {"role": "user", "content": json.dumps(older, ensure_ascii=False)},
                 ],
-                "max_tokens": min(4096, self.config.model.max_output_tokens),
-                "temperature": 0,
-                "extra_body": self._extra_body(),
+                "max_tokens": self.config.model.compaction.max_output_tokens,
+                "temperature": self.config.model.compaction.temperature,
+                "extra_body": {**self._extra_body(), **self.config.model.compaction.extra_body, "cache_prompt": True},
             }
             compact_tokens = await self._count_tokens(compact_request)
             if compact_tokens + compact_request["max_tokens"] >= self.config.model.context_window:
                 raise InterventionRequired(
                     "model", {"error": "History is too large for one compaction request"}
                 )
-            response = await self._complete(request_kind="compaction", **compact_request)
-            summary = response.choices[0].message.content or "No summary was returned."
+            backup = self.session_path.parent / "compactions" / f"{self.session_path.stem}-{uuid.uuid4().hex}.json"
+            self.save()
+            atomic_json(backup, json.loads(self.session_path.read_text()))
+            try:
+                response = await self._complete(request_kind="compaction", **compact_request)
+                choice = response.choices[0]
+                summary = choice.message.content
+                if (
+                    not isinstance(summary, str) or not summary.strip()
+                    or choice.finish_reason != "stop"
+                    or bool(getattr(choice.message, "tool_calls", None))
+                ):
+                    raise ValueError(f"Empty, incomplete, or truncated summary (finish_reason={choice.finish_reason!r})")
+            except Exception as error:
+                detail = {"role": self.role, "error": str(error), "history_path": str(backup)}
+                self.store.event(self.project_id, "session_compaction_failed", detail)
+                raise InterventionRequired("compaction", detail) from error
             self.messages = [{"role": "user", "content": "Prior-session summary:\n" + summary}, *recent]
             self.usage["compactions"] += 1
             self.cache_audit["last_agent_input_tokens"] = None
             self.cache_audit["reset_reason"] = "compaction"
             self.save()
-            self.store.event(self.project_id, "session_compacted", {"role": self.role})
+            self.store.event(self.project_id, "session_compacted", {"role": self.role, "history_path": str(backup)})
         raise InterventionRequired("model", {"error": "History remains above the compaction threshold"})
 
     def _tool_payload(self, result: Any) -> str:
@@ -493,6 +515,11 @@ class AgentSession:
                 **self._agent_request(definitions),
             )
             message = response.choices[0].message
+            truncated = getattr(response.choices[0], "finish_reason", None) == "length"
+            limit_notice = (
+                "The previous response exhausted its output limit. Inspect existing files and use smaller "
+                "coherent edits instead of repeating an oversized whole-file rewrite."
+            )
             assistant: dict[str, Any] = {"role": "assistant", "content": message.content}
             malformed_arguments: dict[str, str] = {}
             if message.tool_calls:
@@ -518,7 +545,7 @@ class AgentSession:
                         else "Continue working, then call submit_results; plain text does not end the iteration."
                     )
                 )
-                self.messages.append({"role": "user", "content": followup})
+                self.messages.append({"role": "user", "content": (limit_notice + "\n" if truncated else "") + followup})
                 self.save()
                 continue
             for call in message.tool_calls:
@@ -586,4 +613,7 @@ class AgentSession:
                 self.save()
             if self.terminal():
                 return self.usage
+            if truncated:
+                self.messages.append({"role": "user", "content": limit_notice})
+                self.save()
             self._pause_checkpoint()

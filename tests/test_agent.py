@@ -147,8 +147,10 @@ async def test_malformed_tool_call_is_sanitized_before_next_request(config, tmp_
         return 10
 
     async def complete(**_request):
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-            content=None, tool_calls=next(responses)))])
+        calls = next(responses)
+        return SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="length" if len(calls) == 2 else "tool_calls",
+            message=SimpleNamespace(content=None, tool_calls=calls))])
 
     monkeypatch.setattr(session, "_count_tokens", count)
     monkeypatch.setattr(session, "_complete", complete)
@@ -159,6 +161,8 @@ async def test_malformed_tool_call_is_sanitized_before_next_request(config, tmp_
     assert len(seen_requests) == 2
     assert session.messages[1]["tool_calls"][1]["function"]["arguments"] == "{}"
     assert "not valid JSON" in session.messages[3]["content"]
+    assert any("exhausted its output limit" in m.get("content", "")
+               for m in session.messages if m["role"] == "user")
     store.close()
 
 
@@ -240,7 +244,9 @@ async def test_cache_usage_is_recorded_and_unexpected_reprocessing_warns(config,
 
     class Completions:
         async def create(self, **_request):
-            return next(responses)
+            response = next(responses)
+            response.choices = [SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="answer"))]
+            return response
 
     session.client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
     await session._complete("agent", model="test-model", messages=[])
@@ -289,7 +295,7 @@ async def test_compaction_uses_existing_96k_threshold_with_exact_count(config, t
         return next(counts)
 
     async def complete(**_request):
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))])
+        return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="summary"))])
 
     monkeypatch.setattr(session, "_count_tokens", count)
     monkeypatch.setattr(session, "_complete", complete)
@@ -299,6 +305,41 @@ async def test_compaction_uses_existing_96k_threshold_with_exact_count(config, t
     assert session.usage["compactions"] == 1
     assert session.messages[0]["content"] == "Prior-session summary:\nsummary"
     assert requests[0]["messages"][0]["content"] == "system prompt"
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content,finish", [(None, "length"), ("", "stop"), ("  ", "stop"), ("partial", "length")])
+async def test_failed_compaction_preserves_history(config, tmp_path, monkeypatch, content, finish) -> None:
+    from irh.errors import InterventionRequired
+
+    session, store = make_session(config, tmp_path)
+    session.messages = [{"role": "user", "content": f"fact {i}"} for i in range(20)]
+    session.save()
+    original = json.loads(session.session_path.read_text())
+    counts = iter((24000, 1000))
+    requests = []
+
+    async def count(_request):
+        return next(counts)
+
+    async def complete(**request):
+        requests.append(request)
+        return SimpleNamespace(choices=[SimpleNamespace(finish_reason=finish, message=SimpleNamespace(content=content))])
+
+    monkeypatch.setattr(session, "_count_tokens", count)
+    monkeypatch.setattr(session, "_complete", complete)
+    with pytest.raises(InterventionRequired):
+        await session.compact_if_needed([])
+    assert session.messages == original["messages"]
+    assert session.usage["compactions"] == 0
+    assert json.loads(session.session_path.read_text())["messages"] == original["messages"]
+    backup = next((session.session_path.parent / "compactions").glob("*.json"))
+    assert json.loads(backup.read_text()) == original
+    assert len(requests) == 1
+    assert requests[0]["extra_body"]["reasoning_effort"] == "none"
+    assert requests[0]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert any(e["kind"] == "session_compaction_failed" for e in store.events(session.project_id))
     store.close()
 
 

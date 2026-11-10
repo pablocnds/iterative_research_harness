@@ -281,3 +281,25 @@ The local controller task manager is now named `ExecutionManager`; the old
 are journaled in SQLite before lifecycle transitions, and review commits its
 proposal before a separate dispatch checkpoint. A recovered accepted paper is
 finalized rather than asking the agent to submit it again.
+
+## Compaction and synchronous shell lifetime
+
+Each shell call has a private process namespace and fresh `/tmp`. Children end
+when the call ends, including detached `nohup`/`setsid` jobs. Run batches in the
+foreground; use `/workspace` (iteration) or `/scratch` (planner) for durable files.
+Persist per-run completion records before considering a cell resumable.
+
+`model.compaction` independently configures summary `max_output_tokens` (4096),
+`temperature` (0.7), and `extra_body`. Defaults disable thinking using
+`reasoning_effort: "none"` and `chat_template_kwargs.enable_thinking: false`, with
+top-p 0.8 and presence penalty 1.5 for the current Qwen profile. Ordinary agent
+reasoning and the existing compaction threshold remain unchanged.
+
+Before summarization, the full session is archived beneath
+`controller/PROJECT/sessions/compactions/`. Empty, truncated, or incomplete
+summaries cannot replace history. Failure emits `session_compaction_failed`
+and `operator_intervention_required`, preserving progress for inspection rather
+than retrying automatically. Model events include finish reason and answer/
+reasoning lengths; successful compaction events identify the history archive.
+Validation claims must name the tested build and inputs and retain material
+limitations; a PASS for an older build does not validate current results.

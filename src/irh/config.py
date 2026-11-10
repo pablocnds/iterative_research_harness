@@ -8,6 +8,19 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+class CompactionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_output_tokens: int = Field(default=4096, gt=0)
+    temperature: float = 0.7
+    extra_body: dict[str, object] = Field(default_factory=lambda: {
+        "reasoning_effort": "none",
+        "chat_template_kwargs": {"enable_thinking": False},
+        "top_p": 0.8,
+        "presence_penalty": 1.5,
+    })
+
+
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -19,11 +32,14 @@ class ModelConfig(BaseModel):
     request_timeout_seconds: float = Field(default=3_600, gt=0)
     temperature: float = 1.0
     extra_body: dict[str, object] = Field(default_factory=dict)
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
 
     @model_validator(mode="after")
     def validate_window(self) -> ModelConfig:
         if self.max_output_tokens >= self.context_window / 2:
             raise ValueError("max_output_tokens must leave at least half the context for input")
+        if self.compaction.max_output_tokens >= self.context_window / 2:
+            raise ValueError("compaction.max_output_tokens must leave input headroom")
         return self
 
 
