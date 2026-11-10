@@ -5,7 +5,7 @@
 Global configuration defines trusted MCP servers. A project explicitly selects
 server IDs when it is created. For each phase the daemon connects to those
 servers, lists their tools, filters them through the configured role allowlist,
-and gives the model first-class names such as `runpod__wait`. The original input
+and gives the model first-class names such as `exa__web_search_exa`. The original input
 schema, description, structured result, and error status are preserved.
 
 The small harness layer around MCP contains only:
@@ -43,44 +43,3 @@ arguments. The example configuration is in `config/exa-tool.json`.
 Using the hosted MCP server avoids a Pi-specific integration and keeps search
 and fetching behind the same native tool boundary as every other optional
 capability.
-
-## Runpod
-
-`irh-runpod-mcp` is a thin MCP facade over the standalone tool's private Unix
-socket. It exposes the standalone operations directly: `run`, `status`, `wait`,
-`cancel`, and `replace`. Project, session, and Pod identifiers are not model
-arguments. One harness project uses one durable Runpod session and therefore the
-same retained Pod semantics. Job IDs remain explicit for stale-call protection
-and auditability.
-
-The adapter freezes named inputs from the current iteration workspace into the
-standalone service's controller-owned input root before submission. Verified
-outputs collected by that service are reflinked into `gpu-outputs/` in the
-iteration workspace, where they can be registered as ordinary harness evidence.
-Provider credentials, provisioning, SSH, billing, migration, transfer retries,
-and incident resolution remain exclusively in `runpod_agent_tool`.
-
-The hidden `host_status` MCP tool is polled over a connection dedicated to the
-monitor, separate from model-initiated calls. A durable Runpod incident or loss
-of its required monitor pauses the full research workflow; it is never presented
-as an ordinary agent-fixable failure. Incident resolution is not in the role
-allowlist and remains an operator action against the standalone service.
-
-While `wait` is blocked in capacity acquisition, provisioning, staging,
-migration, or output synchronization, the adapter sends private MCP progress
-markers that pause the harness active-time clock. Metered GPU execution and any
-useful local agent work continue to consume harness time. These markers are not
-model-visible and do not add an agent-facing timing API.
-
-During timeout write-up and paper review, external tools are not shown to the
-model. Configured host monitors continue running so infrastructure incidents
-still pause the workflow. An existing asynchronous job may finish late; the
-paper must label results not yet synchronized into its workspace as pending.
-
-The example adapter configuration is in `config/runpod-tool.json`. Its
-`input-root` and `output-root` must exactly match the standalone service config
-and be writable/readable respectively by `rh-agent` (normally via
-`irh-worker`). Add that object to the main configuration's `tools` array before
-creating a project with `--tool runpod`. The optional adapter rejects symlinks in
-agent-selected input and publication paths before copying across its trusted
-filesystem boundary.

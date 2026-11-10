@@ -42,5 +42,5 @@ uv run pytest -q
 ```
 
 The tests exercise the lifecycle, real Bubblewrap containment, the API, direct
-MCP discovery/calls, Runpod argument binding, manual intervention, workspaces,
+MCP discovery/calls, manual intervention, workspaces,
 and artifact hashing without making paid provider calls.

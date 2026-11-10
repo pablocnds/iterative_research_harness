@@ -19,7 +19,6 @@ PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/iterative-research-harness
-ReadWritePaths=-/var/lib/runpod-agent-tool
 
 [Install]
 WantedBy=multi-user.target
