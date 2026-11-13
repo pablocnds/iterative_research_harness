@@ -70,7 +70,7 @@ class ProjectCreate(BaseModel):
     goal: str = Field(min_length=1)
     guidelines: str = ""
     budget_seconds: float | None = Field(default=None, gt=0)
-    tools: list[str] = Field(default_factory=list)
+    tools: list[str] | None = None
     upper_skills: list[str] = Field(default_factory=list)
     iteration_skills: list[str] = Field(default_factory=list)
 

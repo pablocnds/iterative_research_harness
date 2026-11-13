@@ -107,6 +107,7 @@ class HarnessConfig(BaseModel):
     model: ModelConfig
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     tools: list[ExternalToolConfig] = Field(default_factory=list)
+    default_tools: list[str] = Field(default_factory=list)
     project_seconds: int = Field(default=604_800, gt=0)
     iteration_seconds: int = Field(default=28_800, gt=0)
     max_iteration_seconds: int = Field(default=86_400, gt=0)
@@ -121,6 +122,8 @@ class HarnessConfig(BaseModel):
         ids = [tool.id for tool in self.tools]
         if len(ids) != len(set(ids)):
             raise ValueError("external tool ids must be unique")
+        if len(set(self.default_tools)) != len(self.default_tools) or set(self.default_tools) - set(ids):
+            raise ValueError("default_tools must contain distinct configured tool ids")
         return self
 
     def tool(self, tool_id: str) -> ExternalToolConfig:

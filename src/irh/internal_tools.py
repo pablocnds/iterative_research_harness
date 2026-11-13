@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+import uuid
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -9,9 +11,21 @@ from .sandbox import Sandbox
 from .store import Store
 from .tooling import AgentTool
 from .types import Decision, IterationReport, Role, ToolResult
-from .workspace import contained, reject_symlinks, report_files, validate_inputs
+from .workspace import contained, reject_symlinks, report_files, validate_inputs, validate_paper
 
 EMPTY_OBJECT = {"type": "object", "properties": {}, "additionalProperties": False}
+
+
+def atomic_text(target, content):
+    temporary = target.with_name(f".{target.name}-{uuid.uuid4().hex}")
+    try:
+        with temporary.open("x") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _object(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
@@ -62,8 +76,9 @@ def phase_tools(
         else:
             timeout = min(float(timeout), seconds_left)
         value = await sandbox.run(arguments["command"], timeout=timeout)
-        return ToolResult(text=json.dumps(value, separators=(",", ":")), structured=value,
-                          is_error=value["exit_code"] != 0)
+        return ToolResult(
+            text=json.dumps(value, separators=(",", ":")), structured=value, is_error=value["exit_code"] != 0
+        )
 
     async def time_remaining(_arguments: dict[str, Any]) -> ToolResult:
         value = {"seconds": remaining()}
@@ -131,11 +146,13 @@ def phase_tools(
             target = contained(sandbox.workspace, arguments["path"])
             reject_symlinks(sandbox.workspace, target)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(arguments["content"])
+            atomic_text(target, arguments["content"])
             return ToolResult(text="File written")
 
         async def edit_file(arguments: dict[str, Any]) -> ToolResult:
             target = contained(sandbox.workspace, arguments["path"])
+            if mode != "normal" and target != sandbox.workspace / "paper.md":
+                raise ValueError("Write-up edits may only modify paper.md")
             reject_symlinks(sandbox.workspace, target)
             if not target.is_file():
                 raise ValueError("Path is not a regular file")
@@ -144,7 +161,10 @@ def phase_tools(
             count = content.count(old)
             if count != 1:
                 raise ValueError(f"old_text must match exactly once; found {count}")
-            target.write_text(content.replace(old, arguments["new_text"], 1))
+            replacement = content.replace(old, arguments["new_text"], 1)
+            if mode != "normal":
+                validate_paper(replacement)
+            atomic_text(target, replacement)
             return ToolResult(text="File edited")
 
         async def submit_results(arguments: dict[str, Any]) -> ToolResult:
@@ -166,22 +186,25 @@ def phase_tools(
                         ),
                         write_file,
                     ),
-                    AgentTool(
-                        "edit_file",
-                        "Replace one exact occurrence in a UTF-8 workspace file.",
-                        _object(
-                            {
-                                "path": {"type": "string", "minLength": 1},
-                                "old_text": {"type": "string", "minLength": 1},
-                                "new_text": {"type": "string"},
-                            },
-                            ["path", "old_text", "new_text"],
-                        ),
-                        edit_file,
-                    ),
                 ]
             )
-        else:
+        # The same general edit interface works during write-up; its handler enforces the paper-only scope.
+        tools.append(
+            AgentTool(
+                "edit_file",
+                "Replace one exact occurrence in a UTF-8 workspace file.",
+                _object(
+                    {
+                        "path": {"type": "string", "minLength": 1},
+                        "old_text": {"type": "string", "minLength": 1},
+                        "new_text": {"type": "string"},
+                    },
+                    ["path", "old_text", "new_text"],
+                ),
+                edit_file,
+            )
+        )
+        if mode != "normal":
             tools.append(
                 AgentTool(
                     "list_files",
@@ -200,13 +223,15 @@ def phase_tools(
             async def write_paper(arguments: dict[str, Any]) -> ToolResult:
                 target = sandbox.workspace / "paper.md"
                 reject_symlinks(sandbox.workspace, target)
-                target.write_text(arguments["content"])
-                return ToolResult(text="paper.md written")
+                validate_paper(arguments["content"])
+                atomic_text(target, arguments["content"])
+                return ToolResult(text="paper.md written; submit_results can accept a partial outcome")
 
             tools.append(
                 AgentTool(
                     "write_paper",
-                    "Write or replace only paper.md in the existing iteration workspace.",
+                    "Write only paper.md with Methodology, Results, Conclusions headings; preserve the existing draft "
+                    "if validation fails. Prefer edit_file for small corrections and submit partial results early.",
                     _object({"content": {"type": "string"}}, ["content"]),
                     write_paper,
                 )

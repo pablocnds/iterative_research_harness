@@ -149,3 +149,29 @@ def test_api_creates_and_reads_project(config, tmp_path: Path) -> None:
         events = client.get(f"/v1/projects/{project_id}/events?limit=2")
         assert len(events.json()) == 2
     store.close()
+
+
+def test_project_tool_defaults_are_frozen_and_explicit_opt_out_is_preserved(config):
+    from irh.config import ExternalToolConfig
+
+    config.tools = [
+        ExternalToolConfig(
+            id="exa",
+            configuration_id="test",
+            transport={"type": "stdio", "command": "unused"},
+            roles={"upper": [], "iteration": []},
+        )
+    ]
+    config.default_tools = ["exa"]
+    store = Store(config.data_root)
+    with TestClient(create_app(config, store, Supervisor(config, store))) as client:
+        inherited = client.post("/v1/projects", json={"name": "default", "goal": "test"}).json()
+        explicit = client.post("/v1/projects", json={"name": "offline", "goal": "test", "tools": []}).json()
+        assert inherited["snapshot"]["enabled_tools"] == ["exa"]
+        assert store.execution_snapshot(inherited["id"])["tools"][0]["id"] == "exa"
+        assert explicit["snapshot"]["enabled_tools"] == []
+        config.default_tools = []
+        assert client.get("/v1/projects/" + inherited["id"]).json()["project"]["snapshot"][
+            "enabled_tools"
+        ] == ["exa"]
+    store.close()

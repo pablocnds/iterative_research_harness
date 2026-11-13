@@ -41,7 +41,14 @@ async def test_writeup_tools_only_read_existing_files_and_write_paper(config, tm
         mode="writeup",
     )
     by_name = {tool.name: tool for tool in tools}
-    assert set(by_name) == {"read_file", "time_remaining", "list_files", "write_paper", "submit_results"}
+    assert set(by_name) == {
+        "read_file",
+        "time_remaining",
+        "list_files",
+        "write_paper",
+        "edit_file",
+        "submit_results",
+    }
     root_listing = await by_name["list_files"].handler({})
     assert root_listing.structured["entries"] == ["result.txt"]
     assert root_listing.structured["next_offset"] is None
@@ -58,6 +65,16 @@ async def test_writeup_tools_only_read_existing_files_and_write_paper(config, tm
     with pytest.raises(ConflictError, match="Results heading"):
         await by_name["write_paper"].handler({"content": "## Methodology\n## Conclusions\n"})
         await by_name["submit_results"].handler({"outcome": "partial"})
+    assert (workspace / "paper.md").read_text() == PAPER
+    await by_name["edit_file"].handler(
+        {"path": "paper.md", "old_text": "## Methodology", "new_text": "## 2. Methodology: existing evidence"}
+    )
+    await by_name["submit_results"].handler({"outcome": "partial"})
+    with pytest.raises(ValueError, match="only modify paper.md"):
+        await by_name["edit_file"].handler({"path": "result.txt", "old_text": "existing", "new_text": "new"})
+    assert (workspace / "result.txt").read_text() == "existing evidence"
+    with pytest.raises(ValueError, match="exactly once"):
+        await by_name["edit_file"].handler({"path": "paper.md", "old_text": "missing", "new_text": "new"})
     store.close()
 
 
@@ -252,3 +269,56 @@ async def test_writeup_agent_keeps_prior_messages_but_only_new_tools(
     ]
     assert [tool["function"]["name"] for tool in seen["tools"]] == ["submit_results"]
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_writeup_preserves_draft_without_launching_millisecond_phase(config, monkeypatch):
+    from irh.types import IterationDefinition
+
+    store = Store(config.data_root)
+    project = store.create_project(ProjectCreate(name="study", goal="measure"), {}, 600)
+    definition = IterationDefinition(subgoal="measure", hypothesis="test", introduction="test", parent=None)
+    store.define_iteration(project["id"], definition, config.iteration_seconds, config.max_iteration_seconds)
+    workspace = store.runtime_dir(project["id"]) / "iteration" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "paper.md").write_text(PAPER)
+    store.start_attempt(project["id"], 1)
+    store.begin_writeup(project["id"], 1, "time limit")
+    store.charge(project["id"], "writeup", config.writeup_seconds - 0.006)
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Millisecond write-up phase must not run")
+
+    monkeypatch.setattr(Controller, "_phase", forbidden)
+    controller = Controller(config, store, project["id"])
+    await controller._writeup()
+    assert store.get_project(project["id"])["phase"] == "paused"
+    assert store.get_project(project["id"])["pause_reason"] == "Write-up grace exhausted"
+    assert (workspace / "paper.md").read_text() == PAPER
+    assert store.history(project["id"])[0]["status"] == "writeup"
+    from irh.controller import ExecutionManager
+
+    with pytest.raises(ConflictError, match="Write-up grace exhausted"):
+        await ExecutionManager(config, store).start(project["id"], resume=True)
+    # A paper accepted just before a crash still finalizes without another model call.
+    store.save_phase_result(project["id"], "iteration-1", "report", IterationReport(outcome="partial"))
+    await controller._writeup()
+    assert store.get_iteration(project["id"], 1)["status"] == "timeout"
+    assert (store.project_dir(project["id"]) / "iterations/0001/workspace/paper.md").is_file()
+    store.close()
+
+
+def test_atomic_paper_write_failure_preserves_previous_draft(tmp_path, monkeypatch):
+    import irh.internal_tools
+
+    target = tmp_path / "paper.md"
+    target.write_text(PAPER)
+
+    def fail(*args):
+        raise OSError("simulated interrupted replacement")
+
+    monkeypatch.setattr(irh.internal_tools.os, "replace", fail)
+    with pytest.raises(OSError):
+        irh.internal_tools.atomic_text(target, "replacement")
+    assert target.read_text() == PAPER
+    assert list(tmp_path.iterdir()) == [target]

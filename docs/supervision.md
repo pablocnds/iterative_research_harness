@@ -316,3 +316,29 @@ speed. Status reuses usage metadata for unchanged session files and invalidates
 that cache on file replacement or modification. Shell pipelines propagate
 upstream failures (`pipefail`, without `errexit`); nonzero command results are
 reported as tool errors with their output retained.
+
+## Project setup and write-up recovery
+
+Configure `default_tools` in the daemon configuration to inherit external tools
+for new projects, for example `"default_tools": ["exa", "manual"]` when both
+servers are configured. Omitted or null `tools` in `POST /v1/projects` inherits
+that list; an explicit list overrides it, and `[]` opts out. The CLI equivalents
+are `irh create ...`, repeated `--tool ID`, and `--no-tools`. Check
+`project.snapshot.enabled_tools` after creation. Existing project snapshots and
+conversation prefixes remain unchanged when defaults change.
+
+A failure pause with `actor=harness` requires a decision; it is not the same as
+an external controller's cooperative pause. Supervisors should automatically
+release only their own pauses. Exhausted write-up stays paused with its draft
+and data intact. A write-up allowance below one second cannot launch another
+phase, and `/run` rejects resuming it until its allowance changes or an already
+accepted paper can be finalized. No unfinished draft is automatically accepted.
+
+During write-up, `edit_file` remains available for small changes to `paper.md`;
+it cannot modify experiment files or run commands. `write_paper` validates the
+required Methodology, Results and Conclusions headings before replacing a draft.
+Headings can be numbered and have subtitles, such as
+`## 2. Methodology: existing evidence`. Edits/replacements are atomic; validation
+or replacement failure preserves the previous file. Use `submit_results` with a
+partial outcome once an honest report is ready, rather than repeatedly polishing
+its full text until grace expires.

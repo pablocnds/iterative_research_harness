@@ -74,14 +74,20 @@ def report_files(workspace: Path, report: IterationReport) -> list[str]:
     if total_size > MAX_REPORT_BYTES:
         raise ConflictError("Paper package exceeds the 8 GiB total limit")
     paper = (workspace / report.paper).read_text(errors="replace")
+    validate_paper(paper)
+    return paths
+
+
+def validate_paper(paper: str) -> None:
+    if len(paper.encode()) > MAX_PAPER_BYTES:
+        raise ConflictError("paper.md exceeds the 4 MiB limit")
     for section in PAPER_SECTIONS:
         if not re.search(
-            rf"^#{{1,6}}\s+(?:\d+(?:\.\d+)*[.)]?\s+)?{section}\s*$",
+            rf"^#{{1,6}}\s+(?:\d+(?:\.\d+)*[.)]?\s+)?{section}(?:\s*[:—–-]\s+[^\n]+)?[ \t]*$",
             paper,
             flags=re.IGNORECASE | re.MULTILINE,
         ):
             raise ConflictError(f"paper.md needs a {section} heading")
-    return paths
 
 
 def validate_inputs(

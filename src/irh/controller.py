@@ -27,6 +27,7 @@ Before substantial time or resource use, choose the smallest useful test, state 
 Start with one useful observable and a small comparison before expanding measurement infrastructure or parameter grids. Search snippets are leads; verify a central claim at its source or mark it preliminary.
 Shell calls are synchronous: their children die at call completion, including nohup/setsid/disown jobs. Each call has fresh /tmp; use /workspace (iteration) or /scratch (planner) for persistent files. Run experiments in the foreground and persist completed work incrementally.
 Validation applies only to its recorded source, binary, and test inputs; record their hashes and rerun relevant checks after changes. Prefer small coherent edits to whole-file rewrites that risk exhausting the output limit.
+Freeze confirmatory plans before fresh results. Check load-bearing estimators against known cases or independent implementations; state uncertainty rather than treating nonsignificance as equivalence. Verify a bounded experiment shard's actual command, concurrency, and measured runtime before scaling.
 Do not invent results, measurements, files, or citations. The harness owns lifecycle, time limits, and durable evidence. A terminal tool ends your phase."""
 
 UPPER_PROMPT = """Your role is researcher and planner. Project history is mounted read-only at /project.
@@ -34,10 +35,10 @@ Define attainable iterations with a hypothesis and enough context to execute the
 Call decide exactly once when ready to start/revise an iteration or conclude the project."""
 
 ITERATION_PROMPT = """Your role is experimenter and executor. Work toward the supplied iteration definition in /workspace.
-Record reproducible commands and measurements in workspace files. Produce a concise paper.md with Methodology, Results, and Conclusions sections; report failures and incomplete work sincerely. Keep paper.md under 4 MiB and select at most 64 supplementary files, each under 2 GiB and at most 8 GiB total.
+Record reproducible commands and measurements in workspace files. Produce a concise paper.md with Methodology, Results, and Conclusions sections; submit a valid partial report before cosmetic polishing; report failures and incomplete work sincerely. Keep paper.md under 4 MiB and select at most 64 supplementary files, each under 2 GiB and at most 8 GiB total.
 Call submit_results with the paper outcome and supplementary paths when finished."""
 
-WRITEUP_PROMPT = """Execution time has ended. Continue from this same session and finish a sincere, concise paper.md using only existing evidence. State missing results, failed checks, interrupted calls, and pending jobs plainly; do not claim unverified outcomes. You may read existing files, write only paper.md, and submit it with at most 64 selected supplementary files; paper.md must stay under 4 MiB, each supplement under 2 GiB, and the package under 8 GiB. No further experiments are available."""
+WRITEUP_PROMPT = """Execution time has ended. Continue from this same session and finish a sincere, concise paper.md using only existing evidence. State missing results, failed checks, interrupted calls, and pending jobs plainly; do not claim unverified outcomes. You may read existing files, write only paper.md, and submit it with at most 64 selected supplementary files; paper.md must stay under 4 MiB, each supplement under 2 GiB, and the package under 8 GiB. No further experiments are available. Make small edits to paper.md using edit_file rather than repeatedly rewriting the entire draft. Submit a valid partial report promptly; do not spend the remaining grace polishing it."""
 
 REVIEW_PROMPT = """Your role is to plan and review the iteration paper and its selected supplementary files in /project. The raw iteration workspace is not available. Assess what the paper supports, request a targeted revision or more evidence if needed, or define the next bounded iteration. For a revision, select needed files from the packet's revision_inputs as definition.inputs; source values are project-root paths and must retain the exact revision_inputs prefix, which differs from read_file paths. The full workspace may be selected without inspecting it. Do not reconstruct the whole experiment from source files. Call decide once when ready."""
 
@@ -632,7 +633,7 @@ class Controller:
             self._finish_with_paper(number, report, status, reason)
             return
         seconds = self.config.writeup_seconds - iteration["writeup_seconds"]
-        if seconds <= 0:
+        if seconds < 1:
             self.store.pause(self.project_id, "Write-up grace exhausted", resume_phase="writeup")
             return
 
@@ -693,6 +694,14 @@ class ExecutionManager:
                 raise ConflictError("Project is paused; explicitly resume it")
             if project["phase"] != "paused" and resume:
                 raise ConflictError("Project is not paused; omit --resume")
+            if project["phase"] == "paused" and project["resume_phase"] == "writeup":
+                iteration = self.store.get_iteration(project_id, project["current_iteration"])
+                accepted = self.store.phase_result(project_id, f"iteration-{project['current_iteration']}")
+                if not accepted and self.config.writeup_seconds - iteration["writeup_seconds"] < 1:
+                    raise ConflictError(
+                        "Write-up grace exhausted; preserve the draft and change the allowance "
+                        "or choose recovery work before resuming"
+                    )
             controller = Controller(self.config, self.store, project_id)
             run = self.store.start_run(project_id, resume, max_iterations, actor)
             task = asyncio.create_task(controller.run(resume), name=f"irh:{project_id}")

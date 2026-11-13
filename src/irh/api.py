@@ -161,7 +161,8 @@ def create_app(
 
     async def create_project(request: Request) -> JSONResponse:
         value = ProjectCreate.model_validate(await body(request))
-        tools = [config.tool(tool_id) for tool_id in value.tools]
+        tool_ids = config.default_tools if value.tools is None else value.tools
+        tools = [config.tool(tool_id) for tool_id in tool_ids]
         prompts = {
             "common": COMMON_PROMPT,
             "upper": UPPER_PROMPT,
@@ -176,7 +177,7 @@ def create_app(
         snapshot = {
             "source": source_identity(),
             "base_prompts": prompts,
-            "enabled_tools": value.tools,
+            "enabled_tools": tool_ids,
             "tool_configurations": [
                 {"id": tool.id, "configuration_id": tool.configuration_id} for tool in tools
             ],

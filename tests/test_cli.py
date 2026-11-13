@@ -73,3 +73,24 @@ def test_publication_cli_uploads_local_text_and_source_references(monkeypatch, t
         {"project_id": "other", "iteration": 2},
     ]
     assert "publication" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "arguments,expected",
+    [([], None), (["--no-tools"], []), (["--tool", "exa", "--tool", "manual"], ["exa", "manual"])],
+)
+def test_create_inherits_or_overrides_tools(monkeypatch, arguments, expected):
+    calls = []
+
+    class FakeAPI:
+        def __init__(self, _socket):
+            pass
+
+        def call(self, method, path, value):
+            calls.append(value)
+            return {}
+
+    monkeypatch.setattr(irh.cli, "API", FakeAPI)
+    monkeypatch.setattr("sys.argv", ["irh", "create", "--name", "study", "--goal", "test", *arguments])
+    irh.cli.main()
+    assert calls[0]["tools"] == expected
